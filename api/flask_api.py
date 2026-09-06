@@ -4308,6 +4308,29 @@ def _ensure_presence_table(conn):
         pass
 
 
+def _ensure_waves_table(conn):
+    """Ensure user_waves table exists for real-time cross-user wave delivery."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_waves (
+            id                VARCHAR(64) PRIMARY KEY,
+            from_username     VARCHAR(255) NOT NULL,
+            from_display_name VARCHAR(255) NOT NULL,
+            from_avatar_url   TEXT,
+            to_username       VARCHAR(255) NOT NULL,
+            to_display_name   VARCHAR(255),
+            to_session_id     VARCHAR(64),
+            status            VARCHAR(32) DEFAULT 'pending',
+            created_at        INTEGER NOT NULL,
+            expires_at        INTEGER NOT NULL
+        )
+    """)
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_waves_to_user ON user_waves (to_username, status, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_waves_to_sess ON user_waves (to_session_id, status, created_at)")
+    except Exception:
+        pass
+
+
 @app.route("/api/presence/heartbeat", methods=["POST"])
 @app.route("/api/community/heartbeat", methods=["POST"])
 def api_presence_heartbeat():
@@ -4429,6 +4452,40 @@ def api_presence_heartbeat():
         ))
         conn.commit()
 
+        # Check for pending waves directed to this user or session
+        _ensure_waves_table(conn)
+        incoming_waves = []
+        try:
+            wave_rows = conn.execute("""
+                SELECT * FROM user_waves
+                WHERE status = 'pending'
+                  AND expires_at >= ?
+                  AND (
+                      (to_username IS NOT NULL AND LOWER(to_username) = LOWER(?))
+                      OR (to_session_id IS NOT NULL AND to_session_id = ?)
+                  )
+                ORDER BY created_at ASC
+            """, (now, username, session_id)).fetchall()
+
+            if wave_rows:
+                wave_ids = []
+                for w in wave_rows:
+                    wave_ids.append(w["id"])
+                    incoming_waves.append({
+                        "id": w["id"],
+                        "fromUsername": w["from_username"],
+                        "fromDisplayName": w["from_display_name"],
+                        "fromAvatarUrl": w["from_avatar_url"] or "",
+                        "toUsername": w["to_username"],
+                        "toDisplayName": w["to_display_name"] or "",
+                        "timestamp": w["created_at"] * 1000,
+                    })
+                q_marks = ",".join(["?"] * len(wave_ids))
+                conn.execute(f"UPDATE user_waves SET status = 'delivered' WHERE id IN ({q_marks})", wave_ids)
+                conn.commit()
+        except Exception as wave_err:
+            logger.warning("[Presence] Error checking waves on heartbeat: %s", wave_err)
+
         # Get active count within last 60s
         row_count = conn.execute(
             "SELECT COUNT(DISTINCT session_id) as c FROM user_online_presence WHERE last_heartbeat >= ?",
@@ -4442,6 +4499,7 @@ def api_presence_heartbeat():
             "sessionId": session_id,
             "online_count": online_count,
             "activeOnlineCount": online_count,
+            "pending_waves": incoming_waves,
             "timestamp": now,
         })
     except Exception as exc:
@@ -4544,6 +4602,136 @@ def api_presence_online():
     except Exception as exc:
         logger.warning("[Presence] Error fetching online presence: %s", exc)
         return jsonify({"ok": False, "error": str(exc), "residents": []}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/presence/wave", methods=["POST"])
+@app.route("/api/community/wave", methods=["POST"])
+def api_presence_send_wave():
+    """Receive an incoming wave directed to another user/resident."""
+    data = request.get_json(silent=True) or {}
+    to_username = str(data.get("toUsername") or data.get("to_username") or "").strip()
+    to_display_name = str(data.get("toDisplayName") or data.get("to_display_name") or "").strip()
+    to_session_id = str(data.get("toSessionId") or data.get("to_session_id") or "").strip()
+
+    if not to_username and not to_session_id:
+        return jsonify({"ok": False, "error": "Target user or session is required"}), 400
+
+    auth_user = _current_auth_user()
+    now = int(time.time())
+
+    from_username = str(data.get("fromUsername") or data.get("from_username") or "").strip()
+    from_display_name = str(data.get("fromDisplayName") or data.get("from_display_name") or "").strip()
+    from_avatar_url = str(data.get("fromAvatarUrl") or data.get("from_avatar_url") or "").strip()
+
+    if auth_user:
+        if not from_username:
+            from_username = str(auth_user.get("username") or auth_user.get("discord_name") or "")
+        if not from_display_name:
+            from_display_name = str(auth_user.get("nickname") or auth_user.get("name") or from_username)
+        if not from_avatar_url:
+            from_avatar_url = str(auth_user.get("avatar") or auth_user.get("avatar_url") or "")
+
+    if not from_username:
+        sess = str(request.headers.get("x-session-id") or data.get("sessionId") or "").strip()
+        short = sess[-4:] if len(sess) >= 4 else "0001"
+        from_username = f"Resident #{short}"
+    if not from_display_name:
+        from_display_name = from_username
+    if not from_avatar_url:
+        from_avatar_url = "https://acnhcdn.com/latest/NpcIcon/der00.png"
+
+    wave_id = "wave_" + hashlib.sha256(f"{from_username}:{to_username}:{to_session_id}:{now}:{time.time()}".encode()).hexdigest()[:16]
+    expires_at = now + 120  # Wave valid for 2 minutes
+
+    conn = get_db()
+    try:
+        _ensure_waves_table(conn)
+        conn.execute("""
+            INSERT INTO user_waves (
+                id, from_username, from_display_name, from_avatar_url,
+                to_username, to_display_name, to_session_id, status, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        """, (
+            wave_id, from_username, from_display_name, from_avatar_url,
+            to_username, to_display_name, to_session_id, now, expires_at
+        ))
+        conn.commit()
+
+        wave_payload = {
+            "id": wave_id,
+            "fromUsername": from_username,
+            "fromDisplayName": from_display_name,
+            "fromAvatarUrl": from_avatar_url,
+            "toUsername": to_username,
+            "toDisplayName": to_display_name,
+            "toSessionId": to_session_id,
+            "timestamp": now * 1000,
+        }
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "wave": wave_payload,
+        })
+    except Exception as exc:
+        logger.warning("[Presence] Error storing wave: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/presence/waves", methods=["GET"])
+@app.route("/api/community/waves", methods=["GET"])
+def api_presence_poll_waves():
+    """Poll for pending waves directed to this user/session."""
+    auth_user = _current_auth_user()
+    now = int(time.time())
+    session_id = str(request.headers.get("x-session-id") or request.args.get("sessionId") or "").strip()
+    username = ""
+    if auth_user:
+        username = str(auth_user.get("username") or auth_user.get("discord_name") or "").strip()
+
+    if not username and not session_id:
+        return jsonify({"ok": True, "waves": []})
+
+    conn = get_db()
+    try:
+        _ensure_waves_table(conn)
+        wave_rows = conn.execute("""
+            SELECT * FROM user_waves
+            WHERE status = 'pending'
+              AND expires_at >= ?
+              AND (
+                  (to_username IS NOT NULL AND to_username != '' AND LOWER(to_username) = LOWER(?))
+                  OR (to_session_id IS NOT NULL AND to_session_id != '' AND to_session_id = ?)
+              )
+            ORDER BY created_at ASC
+        """, (now, username, session_id)).fetchall()
+
+        waves = []
+        if wave_rows:
+            wave_ids = []
+            for w in wave_rows:
+                wave_ids.append(w["id"])
+                waves.append({
+                    "id": w["id"],
+                    "fromUsername": w["from_username"],
+                    "fromDisplayName": w["from_display_name"],
+                    "fromAvatarUrl": w["from_avatar_url"] or "",
+                    "toUsername": w["to_username"],
+                    "toDisplayName": w["to_display_name"] or "",
+                    "toSessionId": w["to_session_id"] or "",
+                    "timestamp": w["created_at"] * 1000,
+                })
+            q_marks = ",".join(["?"] * len(wave_ids))
+            conn.execute(f"UPDATE user_waves SET status = 'delivered' WHERE id IN ({q_marks})", wave_ids)
+            conn.commit()
+
+        return jsonify({"ok": True, "success": True, "waves": waves})
+    except Exception as exc:
+        logger.warning("[Presence] Error polling waves: %s", exc)
+        return jsonify({"ok": False, "waves": []})
     finally:
         conn.close()
 
