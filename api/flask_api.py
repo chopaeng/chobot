@@ -11,6 +11,7 @@ import os
 import re
 import time
 import json
+import hashlib
 import secrets as _secrets
 import logging
 import threading
@@ -33,7 +34,7 @@ from utils import island_access
 from utils.database import connect_db
 from utils.discord_http import request as discord_request
 from utils.helpers import format_locations_text, parse_locations_json, normalize_text, clean_text
-from utils.nickname_format import nickname_warning_for
+from utils.nickname_format import nickname_warning_for, is_valid_acnh_nickname
 from utils.auth_tokens import get_auth_user, make_auth_token, revoke_auth_token, update_auth_user
 from utils.discord_membership import (
     DiscordMembershipUnavailable,
@@ -2952,6 +2953,17 @@ def submit_order_to_bot():
     )
     user_id = str(auth_user.get("user_id") or auth_user.get("id") or "")
 
+    # Require user to setup their server nickname in Character Name | Island Name format before ordering
+    if not auth_user.get("is_admin") and user_id not in ("bot_system", ""):
+        current_nick = str(auth_user.get("nickname") or "").strip()
+        candidate_nick = str(data.get("username") or data.get("display_name") or current_nick).strip()
+        if not is_valid_acnh_nickname(candidate_nick) and not is_valid_acnh_nickname(current_nick):
+            return jsonify({
+                "success": False,
+                "error": "You must set your Discord server nickname to 'Character Name | Island Name' before ordering.",
+                "code": "NICKNAME_REQUIRED",
+            }), 400
+
     payload: dict = {"username": username}
     if order_text:
         payload["order"] = order_text
@@ -4257,6 +4269,281 @@ def api_public_passport_get(username: str):
     except Exception as exc:
         logger.warning("Error fetching public passport for %s: %s", clean_uname, exc)
         return jsonify({"error": str(exc)}), 500
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REAL-TIME ONLINE PRESENCE & COMMUNITY RADAR ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ensure_presence_table(conn):
+    """Ensure user_online_presence table exists with correct schema."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_online_presence (
+            session_id          VARCHAR(64) PRIMARY KEY,
+            user_id             VARCHAR(64),
+            username            VARCHAR(255) NOT NULL,
+            display_name        VARCHAR(255),
+            avatar_url          TEXT,
+            role                VARCHAR(32) DEFAULT 'resident',
+            status              VARCHAR(32) DEFAULT 'online',
+            current_activity    VARCHAR(255),
+            current_path        VARCHAR(255),
+            current_island      VARCHAR(64),
+            ign                 VARCHAR(64),
+            island_name         VARCHAR(64),
+            native_fruit        VARCHAR(32),
+            has_public_passport INTEGER DEFAULT 0,
+            is_guest            INTEGER DEFAULT 0,
+            ip_hash             VARCHAR(64),
+            last_heartbeat      INTEGER NOT NULL,
+            created_at          INTEGER NOT NULL
+        )
+    """)
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_presence_last_heartbeat ON user_online_presence (last_heartbeat)")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_presence_user_id ON user_online_presence (user_id)")
+    except Exception:
+        pass
+
+
+@app.route("/api/presence/heartbeat", methods=["POST"])
+@app.route("/api/community/heartbeat", methods=["POST"])
+def api_presence_heartbeat():
+    """Register or refresh active user presence session."""
+    data = request.get_json(silent=True) or {}
+    current_path = str(data.get("path") or data.get("currentPath") or "/").strip()
+    client_activity = str(data.get("activity") or data.get("currentActivity") or "").strip()
+    session_id = str(data.get("sessionId") or request.headers.get("x-session-id") or "").strip()
+    current_island = str(data.get("currentIsland") or "").strip()
+
+    now = int(time.time())
+    auth_user = _current_auth_user()
+    conn = get_db()
+    try:
+        _ensure_presence_table(conn)
+
+        # 1. Prune stale sessions older than 90 seconds
+        conn.execute("DELETE FROM user_online_presence WHERE last_heartbeat < ?", (now - 90,))
+
+        # 2. Extract identity
+        if auth_user:
+            user_id = str(auth_user.get("user_id") or auth_user.get("discord_id") or auth_user.get("id") or "")
+            username = str(auth_user.get("username") or auth_user.get("discord_name") or "")
+            display_name = str(auth_user.get("nickname") or auth_user.get("name") or username)
+            avatar_url = str(auth_user.get("avatar") or auth_user.get("avatar_url") or "")
+            is_admin = bool(auth_user.get("is_admin"))
+            is_mod = bool(auth_user.get("is_mod"))
+            role = "admin" if is_admin else "mod" if is_mod else "member"
+            is_guest = 0
+            if not session_id:
+                session_id = f"usr_{user_id}"
+
+            # Check passport for enrichments
+            ign = str(data.get("ign") or "").strip()
+            island_name = str(data.get("islandName") or "").strip()
+            native_fruit = str(data.get("nativeFruit") or "Peach").strip()
+            has_public_passport = 0
+
+            pass_row = conn.execute(
+                "SELECT * FROM user_public_passports WHERE user_id = ? OR LOWER(username) = LOWER(?)",
+                (user_id, username)
+            ).fetchone()
+            if pass_row:
+                has_public_passport = int(bool(pass_row["is_public"]))
+                if not ign:
+                    ign = pass_row["primary_ign"] or ""
+                if not island_name:
+                    island_name = pass_row["primary_island"] or ""
+                if pass_row["native_fruit"]:
+                    native_fruit = pass_row["native_fruit"]
+                if not avatar_url and pass_row["avatar_url"]:
+                    avatar_url = pass_row["avatar_url"]
+        else:
+            ip = request.remote_addr or "127.0.0.1"
+            ip_hash = hashlib.sha256(ip.encode()).hexdigest()[:12]
+            if not session_id:
+                session_id = f"guest_{ip_hash}_{now}"
+            user_id = None
+            short_id = session_id[-4:] if len(session_id) >= 4 else "0001"
+            username = f"Resident #{short_id}"
+            display_name = username
+            avatar_url = "https://acnhcdn.com/latest/NpcIcon/der00.png"
+            role = "resident"
+            is_guest = 1
+            ign = str(data.get("ign") or "").strip()
+            island_name = str(data.get("islandName") or "").strip()
+            native_fruit = str(data.get("nativeFruit") or "Peach").strip()
+            has_public_passport = 0
+
+        # Determine status & activity
+        if current_island or "/island/" in current_path or "/islands" in current_path:
+            status = "on_island"
+            activity = client_activity or (f"Exploring {current_island}" if current_island else "Viewing Treasure Islands")
+        elif "/order" in current_path:
+            status = "ordering"
+            activity = client_activity or "Crafting Order Bot Item Bag"
+        elif "/profile" in current_path:
+            status = "online"
+            activity = client_activity or "Styling Resident Passport Studio"
+        elif "/catalog" in current_path:
+            status = "online"
+            activity = client_activity or "Browsing 40,000+ ACNH Catalogue"
+        elif "/find" in current_path:
+            status = "online"
+            activity = client_activity or "Searching Island Stock Finder"
+        else:
+            status = "online"
+            activity = client_activity or "Browsing ChoPaeng"
+
+        # UPSERT active session
+        conn.execute("""
+            INSERT INTO user_online_presence (
+                session_id, user_id, username, display_name, avatar_url, role, status,
+                current_activity, current_path, current_island, ign, island_name,
+                native_fruit, has_public_passport, is_guest, ip_hash, last_heartbeat, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                username = excluded.username,
+                display_name = excluded.display_name,
+                avatar_url = COALESCE(NULLIF(excluded.avatar_url, ''), user_online_presence.avatar_url),
+                role = excluded.role,
+                status = excluded.status,
+                current_activity = excluded.current_activity,
+                current_path = excluded.current_path,
+                current_island = excluded.current_island,
+                ign = COALESCE(NULLIF(excluded.ign, ''), user_online_presence.ign),
+                island_name = COALESCE(NULLIF(excluded.island_name, ''), user_online_presence.island_name),
+                native_fruit = COALESCE(NULLIF(excluded.native_fruit, ''), user_online_presence.native_fruit),
+                has_public_passport = excluded.has_public_passport,
+                is_guest = excluded.is_guest,
+                last_heartbeat = excluded.last_heartbeat
+        """, (
+            session_id, user_id, username, display_name, avatar_url, role, status,
+            activity, current_path, current_island, ign, island_name,
+            native_fruit, has_public_passport, is_guest,
+            hashlib.sha256((request.remote_addr or "127.0.0.1").encode()).hexdigest()[:16],
+            now, now
+        ))
+        conn.commit()
+
+        # Get active count within last 60s
+        row_count = conn.execute(
+            "SELECT COUNT(DISTINCT session_id) as c FROM user_online_presence WHERE last_heartbeat >= ?",
+            (now - 60,)
+        ).fetchone()
+        online_count = row_count["c"] if row_count else 1
+
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "sessionId": session_id,
+            "online_count": online_count,
+            "activeOnlineCount": online_count,
+            "timestamp": now,
+        })
+    except Exception as exc:
+        logger.warning("[Presence] Error recording heartbeat: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/presence/leave", methods=["POST"])
+@app.route("/api/community/leave", methods=["POST"])
+def api_presence_leave():
+    """Remove active presence session when user navigates away or closes tab."""
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get("sessionId") or request.headers.get("x-session-id") or request.args.get("sessionId") or "").strip()
+    if not session_id:
+        auth_user = _current_auth_user()
+        if auth_user:
+            uid = str(auth_user.get("user_id") or auth_user.get("discord_id") or "")
+            session_id = f"usr_{uid}"
+
+    if session_id:
+        conn = get_db()
+        try:
+            conn.execute("DELETE FROM user_online_presence WHERE session_id = ? OR user_id = ?", (session_id, session_id.replace("usr_", "")))
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    return jsonify({"ok": True, "success": True})
+
+
+@app.route("/api/presence/online", methods=["GET"])
+@app.route("/api/community/online", methods=["GET"])
+def api_presence_online():
+    """Retrieve currently active residents for Who's Online roster."""
+    now = int(time.time())
+    conn = get_db()
+    try:
+        _ensure_presence_table(conn)
+
+        # Prune dead sessions older than 60 seconds
+        conn.execute("DELETE FROM user_online_presence WHERE last_heartbeat < ?", (now - 60,))
+        conn.commit()
+
+        # Query all active sessions within last 60 seconds
+        rows = conn.execute("""
+            SELECT * FROM user_online_presence
+            WHERE last_heartbeat >= ?
+            ORDER BY
+                is_guest ASC,
+                CASE role
+                    WHEN 'admin' THEN 1
+                    WHEN 'mod' THEN 2
+                    WHEN 'member' THEN 3
+                    ELSE 4
+                END,
+                last_heartbeat DESC
+            LIMIT 50
+        """, (now - 60,)).fetchall()
+
+        residents = []
+        for r in rows:
+            minutes_ago = max(0, int((now - (r["created_at"] or now)) / 60))
+            residents.append({
+                "id": r["session_id"],
+                "username": r["username"],
+                "displayName": r["display_name"] or r["username"],
+                "avatarUrl": r["avatar_url"] or "https://acnhcdn.com/latest/NpcIcon/der00.png",
+                "ign": r["ign"] or "Resident",
+                "islandName": r["island_name"] or "Island",
+                "nativeFruit": r["native_fruit"] or "Peach",
+                "role": r["role"] or "resident",
+                "status": r["status"] or "online",
+                "currentActivity": r["current_activity"] or "Browsing ChoPaeng",
+                "currentIsland": r["current_island"] or "",
+                "currentPath": r["current_path"] or "/",
+                "hasPublicPassport": bool(r["has_public_passport"]),
+                "isGuest": bool(r["is_guest"]),
+                "joinedMinutesAgo": minutes_ago,
+                "lastHeartbeat": r["last_heartbeat"],
+            })
+
+        total_online = len(residents)
+        auth_count = sum(1 for r in residents if not r["isGuest"])
+        guest_count = total_online - auth_count
+
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "total_online": total_online,
+            "activeOnlineCount": total_online,
+            "authenticated_count": auth_count,
+            "guest_count": guest_count,
+            "residents": residents,
+            "timestamp": now,
+        })
+    except Exception as exc:
+        logger.warning("[Presence] Error fetching online presence: %s", exc)
+        return jsonify({"ok": False, "error": str(exc), "residents": []}), 500
     finally:
         conn.close()
 

@@ -533,6 +533,36 @@ def init_dashboard_db():
             )
         """)
 
+        # User Real-Time Online Presence & Community Radar table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_online_presence (
+                session_id          VARCHAR(64) PRIMARY KEY,
+                user_id             VARCHAR(64),
+                username            VARCHAR(255) NOT NULL,
+                display_name        VARCHAR(255),
+                avatar_url          TEXT,
+                role                VARCHAR(32) DEFAULT 'resident',
+                status              VARCHAR(32) DEFAULT 'online',
+                current_activity    VARCHAR(255),
+                current_path        VARCHAR(255),
+                current_island      VARCHAR(64),
+                ign                 VARCHAR(64),
+                island_name         VARCHAR(64),
+                native_fruit        VARCHAR(32),
+                has_public_passport INTEGER DEFAULT 0,
+                is_guest            INTEGER DEFAULT 0,
+                ip_hash             VARCHAR(64),
+                last_heartbeat      INTEGER NOT NULL,
+                created_at          INTEGER NOT NULL
+            )
+        """)
+
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_presence_last_heartbeat ON user_online_presence (last_heartbeat)")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_presence_user_id ON user_online_presence (user_id)")
+        except Exception:
+            pass
+
         try:
             conn.execute("CREATE INDEX IF NOT EXISTS ix_user_custom_presets_user ON user_custom_presets (user_id, updated_at)")
         except Exception:
