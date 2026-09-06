@@ -4736,6 +4736,54 @@ def api_presence_poll_waves():
         conn.close()
 
 
+# -------------------------------------------------------------
+# ISLAND NHL MAP & SECTOR RADAR ROUTES
+# -------------------------------------------------------------
+@app.route("/api/islands/<island_name>/map", methods=["GET"])
+def api_get_island_map(island_name: str):
+    """
+    Returns full parsed item and sector layout for an island.
+    Reads from VILLAGERS_DIR/<island_name>/nhl/maprefresh.nhl or
+    TWITCH_VILLAGERS_DIR/<island_name>/nhl/maprefresh.nhl.
+    """
+    from utils.nhl_map_parser import get_island_map_data
+    force = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    data = get_island_map_data(island_name, force_refresh=force)
+    return jsonify({"ok": True, **data})
+
+
+@app.route("/api/islands/<island_name>/map/search", methods=["GET"])
+def api_search_island_map(island_name: str):
+    """
+    Searches items or categories on an island map to return exact coordinates and sectors.
+    """
+    from utils.nhl_map_parser import search_island_items
+    q = request.args.get("q", "").strip()
+    result = search_island_items(island_name, q)
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/islands/maps", methods=["GET"])
+def api_list_island_maps():
+    """
+    Lists available islands and the detection status of their maprefresh.nhl.
+    """
+    from utils.nhl_map_parser import locate_nhl_file
+    islands_to_check = [
+        "SILAKBO", "TALA", "SINAGTALA", "TADHANA", "TINIG", "DALANGIN", "HIRAYA", "LUMINA", "MUTYA"
+    ]
+    status_list = []
+    for isl in islands_to_check:
+        filepath, exists, checked = locate_nhl_file(isl)
+        status_list.append({
+            "island": isl,
+            "has_nhl": exists,
+            "file_path": filepath if exists else None,
+            "expected_paths": checked,
+        })
+    return jsonify({"ok": True, "islands": status_list})
+
+
 
 def run_flask_app(host='0.0.0.0', port=8100):
     """Run Flask app with retry logic for port binding after OTA restart."""
