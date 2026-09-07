@@ -138,6 +138,125 @@ def locate_nhl_file(island_name: str) -> Tuple[Optional[str], bool, List[str]]:
     return (checked_paths[0] if checked_paths else None), False, checked_paths
 
 
+def locate_island_nhl_files(
+    island_name: str, specific_file: Optional[str] = None
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Locates all .nhl files (or a specific requested .nhl file) for an island across both:
+      - Config.VILLAGERS_DIR (Sub / VIP Islands)
+      - Config.TWITCH_VILLAGERS_DIR (Free / Twitch Islands)
+
+    Checks both the `nhl/` subfolder and the root folder for the island.
+    Returns: (found_files_list, checked_expected_paths)
+    Each item in found_files_list is a dict:
+      {
+          "filename": str,
+          "file_path": str,
+          "size_bytes": int,
+          "modified_at": float,
+      }
+    """
+    if not island_name:
+        return [], []
+
+    clean_name = island_name.strip()
+    norm_name = re.sub(r"[^a-zA-Z0-9]", "", clean_name).lower()
+
+    search_roots = [
+        Config.VILLAGERS_DIR,
+        Config.TWITCH_VILLAGERS_DIR,
+    ]
+
+    target_filename = None
+    if specific_file:
+        target_filename = os.path.basename(specific_file.strip())
+        if not target_filename.lower().endswith(".nhl"):
+            return [], [f"Invalid file extension for {target_filename}"]
+
+    checked_paths: List[str] = []
+    found_files: List[Dict[str, Any]] = []
+    seen_filenames = set()
+
+    for root in search_roots:
+        if not root:
+            continue
+
+        direct_island_dir = os.path.join(root, clean_name)
+        direct_nhl_dir = os.path.join(direct_island_dir, "nhl")
+        checked_paths.append(direct_nhl_dir)
+
+        if not os.path.exists(root):
+            continue
+
+        candidate_dirs: List[str] = []
+        if os.path.isdir(direct_island_dir):
+            candidate_dirs.append(direct_island_dir)
+
+        # Case-insensitive / normalized folder match
+        try:
+            for folder in os.listdir(root):
+                f_path = os.path.join(root, folder)
+                if os.path.isdir(f_path):
+                    f_norm = re.sub(r"[^a-zA-Z0-9]", "", folder).lower()
+                    if f_norm == norm_name and f_path not in candidate_dirs:
+                        candidate_dirs.append(f_path)
+        except OSError:
+            pass
+
+        for island_dir in candidate_dirs:
+            # Subdirectories to search: "nhl" subfolder first, then island root folder
+            nhl_sub = os.path.join(island_dir, "nhl")
+            search_folders = [nhl_sub, island_dir]
+
+            for folder in search_folders:
+                if folder not in checked_paths:
+                    checked_paths.append(folder)
+
+                if not os.path.isdir(folder):
+                    continue
+
+                if target_filename:
+                    cand_file = os.path.join(folder, target_filename)
+                    if os.path.isfile(cand_file):
+                        stat = os.stat(cand_file)
+                        return [
+                            {
+                                "filename": target_filename,
+                                "file_path": cand_file,
+                                "size_bytes": stat.st_size,
+                                "modified_at": stat.st_mtime,
+                            }
+                        ], checked_paths
+                else:
+                    try:
+                        for entry in os.listdir(folder):
+                            if entry.lower().endswith(".nhl"):
+                                f_full = os.path.join(folder, entry)
+                                if os.path.isfile(f_full) and entry.lower() not in seen_filenames:
+                                    stat = os.stat(f_full)
+                                    found_files.append(
+                                        {
+                                            "filename": entry,
+                                            "file_path": f_full,
+                                            "size_bytes": stat.st_size,
+                                            "modified_at": stat.st_mtime,
+                                        }
+                                    )
+                                    seen_filenames.add(entry.lower())
+                    except OSError:
+                        pass
+
+    if target_filename:
+        return [], checked_paths
+
+    def _sort_key(item):
+        fname = item["filename"].lower()
+        return (0 if fname == "maprefresh.nhl" else 1, fname)
+
+    found_files.sort(key=_sort_key)
+    return found_files, checked_paths
+
+
 def _coord_to_sector(x: int, y: int, acre_size: int = 16) -> str:
     """Map tile (X, Y) to standard ACNH sector (e.g. A1, B3, F6)."""
     col_idx = min(6, max(0, x // acre_size))

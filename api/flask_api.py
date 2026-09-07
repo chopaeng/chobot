@@ -18,11 +18,13 @@ import threading
 import urllib.parse
 import urllib.error
 import urllib.request
+import io
+import zipfile
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import requests
-from flask import Flask, jsonify, request, session, redirect, url_for
+from flask import Flask, jsonify, request, session, redirect, url_for, send_file
 from flask_cors import CORS
 from thefuzz import process, fuzz
 
@@ -1602,6 +1604,14 @@ def home():
             "patreon_posts": {
                 "path": "/api/patreon/posts",
                 "description": "List cached community posts"
+            },
+            "island_map": {
+                "path": "/api/islands/<island_name>/map",
+                "description": "Get parsed item and sector layout for an island"
+            },
+            "island_map_download": {
+                "path": "/api/islands/<island_name>/map/download",
+                "description": "Download raw .nhl layer files (single file, list, or zip bundle) for an island"
             },
             "health": {
                 "path": "/api/health",
@@ -4750,6 +4760,122 @@ def api_get_island_map(island_name: str):
     force = request.args.get("refresh", "").lower() in ("1", "true", "yes")
     data = get_island_map_data(island_name, force_refresh=force)
     return jsonify({"ok": True, **data})
+
+
+@app.route("/api/islands/<island_name>/map/download", methods=["GET"])
+def api_download_island_nhl(island_name: str):
+    """
+    Download .nhl (New Horizons Layer) files for an island.
+    - Query parameter `file`: download a specific .nhl file (e.g. ?file=maprefresh.nhl).
+    - Query parameter `list=true` / `?list=1`: return JSON list of available .nhl files with sizes and download URLs.
+    - Query parameter `format=zip` or `all=true`: download all available .nhl files bundled into a .zip archive.
+    - Default:
+        - If maprefresh.nhl exists, downloads maprefresh.nhl.
+        - If multiple .nhl files exist and no maprefresh.nhl, downloads as a .zip.
+        - If exactly 1 .nhl file exists, downloads that file.
+    """
+    from utils.nhl_map_parser import locate_island_nhl_files
+
+    island_clean = island_name.strip() if island_name else ""
+    if not island_clean:
+        return jsonify({"ok": False, "error": "Island name is required."}), 400
+
+    # 1. Listing mode
+    list_requested = request.args.get("list", "").lower() in ("1", "true", "yes")
+    if list_requested:
+        files, checked = locate_island_nhl_files(island_clean)
+        encoded_island = urllib.parse.quote(island_clean)
+        return jsonify({
+            "ok": True,
+            "island": island_clean,
+            "count": len(files),
+            "files": [
+                {
+                    "filename": f["filename"],
+                    "size_bytes": f["size_bytes"],
+                    "modified_at": f["modified_at"],
+                    "download_url": f"/api/islands/{encoded_island}/map/download?file={urllib.parse.quote(f['filename'])}"
+                }
+                for f in files
+            ],
+            "checked_paths": checked,
+        })
+
+    # 2. Specific file requested
+    file_param = request.args.get("file", "").strip()
+    if file_param:
+        safe_filename = os.path.basename(file_param)
+        if not safe_filename.lower().endswith(".nhl"):
+            return jsonify({
+                "ok": False,
+                "error": "Invalid file type. Only .nhl files can be downloaded.",
+                "file": safe_filename,
+            }), 400
+
+        files, checked = locate_island_nhl_files(island_clean, specific_file=safe_filename)
+        if not files:
+            return jsonify({
+                "ok": False,
+                "error": f"File '{safe_filename}' not found for island '{island_clean}'.",
+                "island": island_clean,
+                "checked_paths": checked,
+            }), 404
+
+        target = files[0]
+        download_name = request.args.get("rename", "").strip() or target["filename"]
+        response = send_file(
+            target["file_path"],
+            as_attachment=True,
+            download_name=download_name,
+            mimetype="application/octet-stream",
+        )
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return response
+
+    # 3. All / Default mode
+    files, checked = locate_island_nhl_files(island_clean)
+    if not files:
+        return jsonify({
+            "ok": False,
+            "error": f"No .nhl files found for island '{island_clean}'.",
+            "island": island_clean,
+            "checked_paths": checked,
+        }), 404
+
+    want_zip = (
+        request.args.get("format", "").lower() == "zip"
+        or request.args.get("all", "").lower() in ("1", "true", "yes")
+        or (len(files) > 1 and not any(f["filename"].lower() == "maprefresh.nhl" for f in files))
+    )
+
+    if want_zip:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                zf.write(f["file_path"], arcname=f["filename"])
+        zip_buffer.seek(0)
+        safe_island_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", island_clean)
+        zip_name = f"{safe_island_slug}_nhl_files.zip"
+        response = send_file(
+            zip_buffer,
+            as_attachment=True,
+            download_name=zip_name,
+            mimetype="application/zip",
+        )
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return response
+
+    # Single primary file download (maprefresh.nhl or first available)
+    primary = next((f for f in files if f["filename"].lower() == "maprefresh.nhl"), files[0])
+    download_name = request.args.get("rename", "").strip() or primary["filename"]
+    response = send_file(
+        primary["file_path"],
+        as_attachment=True,
+        download_name=download_name,
+        mimetype="application/octet-stream",
+    )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
 
 
 @app.route("/api/islands/<island_name>/map/search", methods=["GET"])
