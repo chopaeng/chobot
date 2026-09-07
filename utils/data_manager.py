@@ -16,6 +16,9 @@ try:
 except ImportError:
     gspread = None
 
+from utils.config import Config
+from utils.helpers import clean_text
+
 logger = logging.getLogger("DataManager")
 CACHE_FILE = "cache_dump.json"
 
@@ -39,6 +42,7 @@ class DataManager:
         self._villager_cache = {}     # {frozenset(dirs): data}
         self._villager_cache_time = None
         self._villager_cache_ttl = 300  # 5 minutes
+        self.source = "disk_cache" if os.path.exists(CACHE_FILE) else "none"
 
         self._connect_sheets()
         self.load_image_catalog()
@@ -109,7 +113,146 @@ class DataManager:
         except Exception as e:
             logger.error(f"[CACHE] Failed to save dump: {e}")
 
-    def update_cache(self):
+    def update_cache_from_nhl(self) -> bool:
+        """
+        Scan all configured and discovered island .nhl layer files,
+        parse real placed items, and build the item location index.
+        The resulting cache stores item locations strictly as island names
+        (e.g. 'Bonita, Dalangin') with NO coordinates or sectors, matching
+        the exact format used across Discord, Twitch, and Web APIs.
+        """
+        from utils.nhl_map_parser import get_island_map_data, locate_nhl_file
+
+        logger.info("[NHL] Scanning island .nhl files to build item index...")
+        self.last_refresh_attempt = datetime.now()
+        self.last_refresh_status = "running"
+        self.last_refresh_error = None
+
+        candidate_islands = set()
+
+        for isl in getattr(Config, "SUB_ISLANDS", []):
+            if isl:
+                candidate_islands.add(isl.strip())
+        for isl in getattr(Config, "FREE_ISLANDS", []):
+            if isl:
+                candidate_islands.add(isl.strip())
+
+        for base_dir in [getattr(Config, "VILLAGERS_DIR", None), getattr(Config, "TWITCH_VILLAGERS_DIR", None)]:
+            if base_dir and os.path.exists(base_dir):
+                try:
+                    for entry in os.listdir(base_dir):
+                        if os.path.isdir(os.path.join(base_dir, entry)):
+                            candidate_islands.add(entry.strip())
+                except OSError:
+                    pass
+
+        if not candidate_islands:
+            logger.warning("[NHL] No island directories or configured islands found.")
+            return False
+
+        temp_cache = {}
+        display_map = {}
+        islands_indexed = 0
+        total_items_found = 0
+
+        known_lookup = {}
+        for isl in getattr(Config, "SUB_ISLANDS", []) + getattr(Config, "FREE_ISLANDS", []):
+            known_lookup[clean_text(isl)] = isl
+
+        for island_name in sorted(candidate_islands):
+            filepath, exists, _ = locate_nhl_file(island_name)
+            if not exists or not filepath:
+                continue
+
+            try:
+                map_data = get_island_map_data(island_name)
+                if not map_data.get("ok"):
+                    continue
+
+                items = map_data.get("items", [])
+                if not items:
+                    continue
+
+                canonical_name = known_lookup.get(clean_text(island_name), island_name.title())
+                islands_indexed += 1
+                island_item_count = 0
+
+                for it in items:
+                    name = it.get("name")
+                    if not name:
+                        continue
+
+                    # Filter out sentinel / corrupted names
+                    if name.startswith("Item #6553") or name.startswith("Item #0"):
+                        continue
+
+                    island_item_count += 1
+                    total_items_found += 1
+
+                    # 1. Full item name (e.g. "Royal Crown", "Ironwood Chair (Walnut)")
+                    key = self.normalize_text(name)
+                    if key not in display_map:
+                        display_map[key] = name
+
+                    if key in temp_cache:
+                        current_locs = temp_cache[key].split(", ")
+                        if canonical_name not in current_locs:
+                            temp_cache[key] += f", {canonical_name}"
+                    else:
+                        temp_cache[key] = canonical_name
+
+                    # 2. Base variation name if name contains parentheses e.g. "Ironwood Chair"
+                    if "(" in name and ")" in name:
+                        base_name = re.sub(r"\s*\([^)]*\)", "", name).strip()
+                        if base_name:
+                            base_key = self.normalize_text(base_name)
+                            if base_key != key:
+                                if base_key not in display_map:
+                                    display_map[base_key] = base_name
+                                if base_key in temp_cache:
+                                    cur_locs = temp_cache[base_key].split(", ")
+                                    if canonical_name not in cur_locs:
+                                        temp_cache[base_key] += f", {canonical_name}"
+                                else:
+                                    temp_cache[base_key] = canonical_name
+
+                    # 3. If DIY, index both item name and "<name> diy" / "<name> recipe"
+                    if it.get("diy"):
+                        for suffix in ["diy", "recipe"]:
+                            alt_key = self.normalize_text(f"{name} {suffix}")
+                            if alt_key not in display_map:
+                                display_map[alt_key] = f"{name} {suffix.upper()}"
+                            if alt_key in temp_cache:
+                                cur_locs = temp_cache[alt_key].split(", ")
+                                if canonical_name not in cur_locs:
+                                    temp_cache[alt_key] += f", {canonical_name}"
+                            else:
+                                temp_cache[alt_key] = canonical_name
+
+                logger.info(f"[NHL] Indexed {island_item_count} items from island '{canonical_name}'")
+
+            except Exception as exc:
+                logger.error(f"[NHL] Error reading island '{island_name}': {exc}")
+
+        if temp_cache:
+            temp_cache["_display"] = display_map
+            with self.lock:
+                self.cache = temp_cache
+                self.last_update = datetime.now()
+                self.last_refresh_status = "ok"
+                self.last_refresh_error = None
+                self.source = "nhl"
+            self.save_local_cache()
+            logger.info(
+                f"[NHL] Index complete: {len(temp_cache) - 1} unique items indexed "
+                f"across {islands_indexed} islands ({total_items_found} total placed items)."
+            )
+            return True
+
+        logger.warning("[NHL] Scan finished but no valid items were found in .nhl files.")
+        return False
+
+    def _update_cache_from_sheets(self) -> bool:
         """Fetch items from Google Sheets"""
         logger.info("Updating cache from Google Sheets...")
         self.last_refresh_attempt = datetime.now()
@@ -118,6 +261,11 @@ class DataManager:
 
         if not self.gc:
             self._connect_sheets()
+
+        if not self.gc:
+            self.last_refresh_status = "error"
+            self.last_refresh_error = "Google Sheets client not initialized"
+            return False
 
         try:
             wb = self.gc.open(self.workbook_name)
@@ -170,11 +318,6 @@ class DataManager:
             with self.lock:
                 old_item_count = sum(1 for k in self.cache if k != "_display")
 
-            # Replace cache only when the scan was sufficiently complete:
-            # - all sheets were read successfully, OR
-            # - there was no existing data (first run), OR
-            # - new data has at least as many items as the old cache
-            #   (guards against a partial refresh silently wiping valid data)
             sufficient = (
                 sheets_failed == 0
                 or old_item_count == 0
@@ -185,6 +328,7 @@ class DataManager:
                 with self.lock:
                     self.cache = temp_cache
                     self.last_update = datetime.now()
+                    self.source = "google_sheets"
 
                 self.save_local_cache()
                 self.last_refresh_status = "ok"
@@ -192,6 +336,7 @@ class DataManager:
                     f"Scan complete. {new_item_count} items loaded from "
                     f"{sheets_scanned} sheets ({sheets_failed} failed)."
                 )
+                return True
             else:
                 logger.warning(
                     f"Cache refresh produced insufficient data "
@@ -201,15 +346,46 @@ class DataManager:
                 )
                 self.last_refresh_status = "degraded"
                 self.last_refresh_error = "Refresh produced insufficient data; kept existing cache."
+                return False
 
         except Exception as e:
             logger.error(f"Workbook fetch failed: {e}")
             self.last_refresh_status = "error"
             self.last_refresh_error = str(e)
             self.gc = None  # Force reconnect on next attempt
+            return False
+
+    def update_cache(self, force_source=None) -> bool:
+        """
+        Refresh cache.
+        Checks NHL files first by default (ITEM_DATA_SOURCE='nhl' or 'auto').
+        If NHL files are present, builds item index from .nhl maps.
+        Otherwise falls back to Google Sheets.
+        """
+        source_mode = force_source or getattr(Config, "ITEM_DATA_SOURCE", "nhl").strip().lower()
+
+        if source_mode in ("nhl", "auto"):
+            success = self.update_cache_from_nhl()
+            if success:
+                return True
+            if source_mode == "nhl":
+                logger.info("[DATA] NHL scan found no files; preserving current cache.")
+                return False
+
+        # Fallback or explicit Google Sheets mode
+        return self._update_cache_from_sheets()
 
     def auto_refresh_loop(self):
-        """Background thread to auto-refresh cache"""
+        """
+        Background thread to manage cache refresh.
+        For NHL data, the cache is fixed and persists on disk/in-memory,
+        avoiding unnecessary re-scans.
+        """
+        source_mode = getattr(Config, "ITEM_DATA_SOURCE", "nhl").strip().lower()
+        if source_mode == "nhl":
+            logger.info("[DATA] NHL data source configured; cache is fixed in-memory.")
+            return
+
         while not self.stop_event.wait(3600 * self.cache_refresh_hours):
             self.update_cache()
 

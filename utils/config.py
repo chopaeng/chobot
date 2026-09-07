@@ -27,6 +27,16 @@ class Config:
             return int(val)
         return default
 
+    @staticmethod
+    def _clean_path(val):
+        """Clean file paths, stripping surrounding quotes and repairing \\b backspace escapes from .env"""
+        if not val:
+            return val
+        s = val.strip().strip('"').strip("'")
+        if "\x08" in s:
+            s = s.replace("\x08", "\\b")
+        return s
+
     # General Config
     IS_PRODUCTION = os.getenv('IS_PRODUCTION', 'true').lower() == 'true'
 
@@ -143,10 +153,12 @@ class Config:
     WORKBOOK_NAME = os.getenv('WORKBOOK_NAME')
     JSON_KEYFILE = 'service_account.json'
     CACHE_REFRESH_HOURS = 1
+    # Data Source (nhl | sheets | auto)
+    ITEM_DATA_SOURCE = os.getenv('ITEM_DATA_SOURCE', 'nhl').strip().lower()
 
-    VILLAGERS_DIR = os.getenv('VILLAGERS_DIR')
-    TWITCH_VILLAGERS_DIR = os.getenv('TWITCH_VILLAGERS_DIR')
-    ORDER_BOT_DIR = os.getenv('ORDER_BOT_DIR') or os.getenv('ORDER_BOR_DIR')
+    VILLAGERS_DIR = _clean_path(os.getenv('VILLAGERS_DIR'))
+    TWITCH_VILLAGERS_DIR = _clean_path(os.getenv('TWITCH_VILLAGERS_DIR'))
+    ORDER_BOT_DIR = _clean_path(os.getenv('ORDER_BOT_DIR') or os.getenv('ORDER_BOR_DIR'))
     ORDER_BOT_ISLAND = os.getenv('ORDER_BOT_ISLAND', 'SYSBOT-ACNH-ORDERS')
     ORDER_BOT_CHANNEL_ID = _get_int('ORDER_BOT_CHANNEL_ID', 1175672083183829075)
     ORDER_BOT_DISCORD_ID = _get_int('ORDER_BOT_DISCORD_ID', 1175671093445537802)
