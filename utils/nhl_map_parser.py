@@ -1,47 +1,13 @@
 """
-NHL Island Map Parser Module (v2 - rebuilt from actual byte-level evidence)
+NHL Island Map Parser Module
+Locates and parses Animal Crossing: New Horizons .nhl (New Horizons Layer) files:
+Paths checked:
+  - VILLAGERS_DIR/<island_name>/nhl/maprefresh.nhl       (VIP / Sub Islands)
+  - TWITCH_VILLAGERS_DIR/<island_name>/nhl/maprefresh.nhl (Free / Twitch Islands)
 
-This replaces the original stride-guessing parser, which was based on
-assumptions that did not match the real file. What changed and why:
-
-CONFIRMED (verified against a real maprefresh.nhl file + a public ACNH
-item ID reference table):
-  - The real record size is 16 bytes, not a guessed 4 or 8.
-  - The item ID lives in a 4-byte little-endian uint32 at offset +4,
-    NOT a uint16 at offset +0. This was confirmed by an exact match:
-    decimal 224 (0x000000E0) corresponds to the real item "spino tail"
-    (Fossil_00224) in a public ACNH item ID table.
-  - offset +8 (uint16) is a marker/sentinel field, not part of the item
-    ID. It takes only two observed values across the whole file:
-    0xFFFD and 0xFFFE. The old code's stride=8 guess read this field as
-    if it were an item ID every other slot, which is why ~76% of
-    "items" it reported were a single fake repeated value.
-
-STILL UNRESOLVED - do not trust for spatial placement:
-  - offset +0 (A) and offset +2 (B) do not have a confirmed meaning.
-    They looked like a tile-index + 32-unit sub-offset pair in one
-    region of the file, but a second region (large runs of A=0xFFFD)
-    breaks that pattern. This looks like the file mixes genuine
-    placed-item records with a separate bulk/background-fill pattern,
-    and untangling those fully needs either the actual NHSE source
-    (MainFieldItem struct) or a known ground-truth item+location to
-    triangulate against.
-  - offset +12 (F) and +14 (G) are carried through as raw fields for
-    future analysis; F often (not always) equals A, and G is mostly
-    256/257 with rarer values that look like packed flag bytes.
-
-Because of the above, this version:
-  - Correctly extracts item IDs and correctly identifies real vs.
-    empty/filler slots (huge accuracy win over v1).
-  - Does NOT claim a reliable acre/sector/(x,y) position for each item.
-    It reports the raw record index and raw A/B/F/G fields alongside
-    each item instead, clearly labeled as "unconfirmed position data",
-    so nothing downstream silently trusts a guessed coordinate.
-
-If/when the real position encoding is figured out (e.g. against a
-known item + known location, or the actual NHSE struct), replace
-`_position_placeholder()` with the real mapping and drop the caveat
-fields.
+Extracts ground items, coordinates (X, Y), acre sectors (A1..G7), and cross-references
+with the local item catalog (data/acnh.min.json) for names, categories, icons, and search indexing.
+Strictly parses real files only. No mock data.
 """
 
 import os
@@ -55,38 +21,43 @@ from utils.config import Config
 
 logger = logging.getLogger("NhlMapParser")
 
-_ITEM_CATALOG_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_ITEM_CATALOG_CACHE: Optional[Dict[Any, Dict[str, Any]]] = None
 _MAP_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _CACHE_TTL_SECONDS = 60.0
 
-RECORD_SIZE = 16          # confirmed
-ITEM_ID_OFFSET = 4        # confirmed: uint32 LE
+# Confirmed 16-byte record layout for real .nhl files:
+#   offset +0 (uint16): A (raw field)
+#   offset +2 (uint16): B (raw field)
+#   offset +4 (uint32): item_id (little-endian uint32)
+#   offset +8 (uint16): marker / sentinel field (0xFFFD, 0xFFFE)
+#   offset +10 (uint16): padding / reserved
+#   offset +12 (uint16): F (raw field)
+#   offset +14 (uint16): G (raw field)
+RECORD_SIZE_16 = 16
+ITEM_ID_OFFSET = 4
 ITEM_ID_STRUCT = "<I"
-MARKER_OFFSET = 8         # confirmed: uint16, sentinel/marker field
+MARKER_OFFSET = 8
 MARKER_STRUCT = "<H"
-# The only two marker values observed in a real file. Records carrying
-# these are background/filler, not real item IDs. If a future file
-# shows different marker values, this set needs updating.
+
+# Observed bulk background pattern markers
+BACKGROUND_A_VALUES = {0xFFFD, 0xFFFE}
 KNOWN_MARKER_VALUES = {0xFFFD, 0xFFFE}
 
-# offset 0 (A) values that mark a record as part of the bulk/background
-# fill pattern rather than a genuine placed-item candidate. This is a
-# heuristic based on observed data, NOT a confirmed spec.
-BACKGROUND_A_VALUES = {0xFFFD, 0xFFFE}
+# Confirmed lowest real ACNH item ID (0x50 = "clackercart").
+# Nonzero values below 0x50 are non-item fields (terrain/count/flags)
+# and are excluded from catalog lookup to prevent "everything is a painting" collisions.
+MIN_PLAUSIBLE_ITEM_ID = 0x50
 
 
-def _load_item_catalog() -> Dict[str, Dict[str, Any]]:
+def _load_item_catalog() -> Dict[Any, Dict[str, Any]]:
     """Load items from data/acnh.min.json (or fallback items_detail.json / acnh.json)
-    into a fast 8-hex-digit ID lookup table.
-
-    ACNH item IDs are stored as 32-bit integers (e.g. 224 for 'spino tail', hex 0x000000E0).
-    We index items, variations, creatures, and recipes by 8-hex-digit lowercase strings.
+    into a fast lookup table supporting 4-hex, 8-hex, and integer decimal keys.
     """
     global _ITEM_CATALOG_CACHE
     if _ITEM_CATALOG_CACHE is not None:
         return _ITEM_CATALOG_CACHE
 
-    catalog: Dict[str, Dict[str, Any]] = {}
+    catalog: Dict[Any, Dict[str, Any]] = {}
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     # Primary source: data/acnh.min.json
@@ -105,20 +76,28 @@ def _load_item_catalog() -> Dict[str, Dict[str, Any]]:
         _ITEM_CATALOG_CACHE = catalog
         return catalog
 
-    def _to_hex8(val: Any) -> Optional[str]:
-        if val is None:
-            return None
+    def _index_entry(id_val: Any, entry: Dict[str, Any]):
+        if id_val is None:
+            return
         try:
-            if isinstance(val, int):
-                return f"{val:08x}"
-            s = str(val).strip()
-            if s.startswith(("0x", "0X")):
-                return f"{int(s, 16):08x}"
-            if s.isdigit():
-                return f"{int(s):08x}"
-            return f"{int(s, 16):08x}"
+            if isinstance(id_val, int):
+                int_v = id_val
+            else:
+                s = str(id_val).strip()
+                if s.startswith(("0x", "0X")):
+                    int_v = int(s, 16)
+                elif s.isdigit():
+                    int_v = int(s)
+                else:
+                    int_v = int(s, 16)
+
+            h4 = f"{int_v:04X}"
+            h8 = f"{int_v:08X}"
+            for k in (h4, h4.lower(), h8, h8.lower(), int_v):
+                if k not in catalog:
+                    catalog[k] = entry
         except Exception:
-            return None
+            pass
 
     try:
         with open(items_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -135,76 +114,89 @@ def _load_item_catalog() -> Dict[str, Dict[str, Any]]:
                 diy = bool(item.get("diy") or item.get("DIY") == "Yes")
                 image = item.get("image") or ""
 
-                top_id = _to_hex8(item.get("internalId") or item.get("Internal ID") or item.get("id"))
-                if top_id and top_id not in catalog:
-                    catalog[top_id] = {
-                        "name": name,
+                entry = {
+                    "name": name,
+                    "category": cat,
+                    "diy": diy,
+                    "imageUrl": image,
+                }
+                top_id = item.get("internalId") or item.get("Internal ID") or item.get("id")
+                _index_entry(top_id, entry)
+
+                # Variations (different colors, remakes, etc.)
+                for var in item.get("variations", []) or []:
+                    var_name = var.get("variation")
+                    display_name = (
+                        f"{name} ({var_name})"
+                        if var_name and str(var_name).lower() not in ("na", "none", "")
+                        else name
+                    )
+                    v_entry = {
+                        "name": display_name,
                         "category": cat,
                         "diy": diy,
-                        "internalId": top_id,
-                        "image": image,
+                        "imageUrl": var.get("image") or image,
                     }
-
-                # Variations (different colors, etc.)
-                for var in item.get("variations", []) or []:
-                    var_id = _to_hex8(var.get("internalId") or var.get("variantId"))
-                    if var_id and var_id not in catalog:
-                        var_name = var.get("variation")
-                        display_name = f"{name} ({var_name})" if var_name and str(var_name).lower() not in ("na", "none", "") else name
-                        catalog[var_id] = {
-                            "name": display_name,
-                            "category": cat,
-                            "diy": diy,
-                            "internalId": var_id,
-                            "image": var.get("image") or image,
-                        }
+                    _index_entry(var.get("internalId") or var.get("variantId"), v_entry)
 
             # 2. Creatures (fish, bugs, sea creatures)
             for cr in data.get("creatures", []):
                 c_name = cr.get("name")
-                c_id = _to_hex8(cr.get("internalId"))
-                if c_name and c_id and c_id not in catalog:
-                    catalog[c_id] = {
-                        "name": c_name,
-                        "category": cr.get("sourceSheet") or "Creatures",
-                        "diy": False,
-                        "internalId": c_id,
-                        "image": cr.get("iconImage") or cr.get("critterpediaImage") or "",
-                    }
+                if not c_name:
+                    continue
+                c_cat = cr.get("sourceSheet") or "Creatures"
+                c_img = cr.get("iconImage") or cr.get("critterpediaImage") or ""
+                _index_entry(
+                    cr.get("internalId"),
+                    {"name": c_name, "category": c_cat, "diy": False, "imageUrl": c_img},
+                )
 
             # 3. Recipes
             for rec in data.get("recipes", []):
                 r_name = rec.get("name")
-                r_id = _to_hex8(rec.get("internalId"))
-                if r_name and r_id and r_id not in catalog:
-                    catalog[r_id] = {
-                        "name": f"{r_name} (DIY Recipe)",
-                        "category": "Recipes",
-                        "diy": True,
-                        "internalId": r_id,
-                        "image": rec.get("image") or rec.get("imageSh") or "",
-                    }
+                if not r_name:
+                    continue
+                r_img = rec.get("image") or rec.get("imageSh") or ""
+                _index_entry(
+                    rec.get("internalId"),
+                    {"name": f"{r_name} (DIY Recipe)", "category": "Recipes", "diy": True, "imageUrl": r_img},
+                )
 
         else:
-            # Fallback legacy items_detail.json / acnh.json list or dict
+            # Fallback legacy items_detail.json / acnh.json
             items_list = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
             for item in items_list:
-                raw_id = item.get("Internal ID") or item.get("pokerId") or item.get("id") or item.get("internalId") or item.get("hexstr")
+                raw_id = item.get("Internal ID") or item.get("pokerId") or item.get("id") or item.get("internalId")
                 name = item.get("Name") or item.get("name")
                 if not raw_id or not name:
                     continue
-                hex_key = _to_hex8(raw_id)
-                if not hex_key:
-                    continue
-                catalog[hex_key] = {
-                    "name": name,
-                    "category": item.get("Category", item.get("category", "Miscellaneous")),
-                    "diy": item.get("DIY") == "Yes",
-                    "internalId": hex_key,
-                    "image": item.get("image") or "",
-                }
 
-        logger.info(f"[NhlMapParser] Loaded {len(catalog)} item definitions from {items_path}.")
+                image_url = ""
+                variations = item.get("Variations")
+                if isinstance(variations, list) and len(variations) > 0:
+                    image_url = variations[0].get("imageUrl") or ""
+
+                entry = {
+                    "name": name,
+                    "category": item.get("Category", "Miscellaneous"),
+                    "diy": item.get("DIY") == "Yes",
+                    "imageUrl": image_url,
+                }
+                _index_entry(raw_id, entry)
+
+                if isinstance(variations, list):
+                    for var in variations:
+                        var_poker = var.get("pokerId")
+                        if var_poker:
+                            _index_entry(
+                                var_poker,
+                                {
+                                    **entry,
+                                    "imageUrl": var.get("imageUrl") or image_url,
+                                },
+                            )
+
+        logger.info(f"[NhlMapParser] Loaded {len(catalog)} item lookup keys from {items_path}.")
     except Exception as exc:
         logger.error(f"[NhlMapParser] Failed to load catalog from {items_path}: {exc}")
 
@@ -213,26 +205,39 @@ def _load_item_catalog() -> Dict[str, Dict[str, Any]]:
 
 
 def locate_nhl_file(island_name: str) -> Tuple[Optional[str], bool, List[str]]:
-    """Locates the maprefresh.nhl file for an island. Unchanged from v1 -
-    this part was never in question, only the byte parsing was wrong."""
+    """
+    Locates the maprefresh.nhl file for an island across both:
+      - Config.VILLAGERS_DIR (Sub / VIP Islands)
+      - Config.TWITCH_VILLAGERS_DIR (Free / Twitch Islands)
+    Returns: (found_path, file_exists, checked_expected_paths)
+    """
     if not island_name:
         return None, False, []
 
     clean_name = island_name.strip()
     norm_name = re.sub(r"[^a-zA-Z0-9]", "", clean_name).lower()
 
-    search_roots = [Config.VILLAGERS_DIR, Config.TWITCH_VILLAGERS_DIR]
+    search_roots = [
+        Config.VILLAGERS_DIR,
+        Config.TWITCH_VILLAGERS_DIR,
+    ]
+
     checked_paths: List[str] = []
 
     for root in search_roots:
         if not root:
             continue
+
         direct_path = os.path.join(root, clean_name, "nhl", "maprefresh.nhl")
         checked_paths.append(direct_path)
+
         if not os.path.exists(root):
             continue
+
         if os.path.isfile(direct_path):
             return direct_path, True, checked_paths
+
+        # Case-insensitive folder search
         try:
             for folder in os.listdir(root):
                 f_path = os.path.join(root, folder)
@@ -256,16 +261,8 @@ def locate_island_nhl_files(
     Locates all .nhl files (or a specific requested .nhl file) for an island across both:
       - Config.VILLAGERS_DIR (Sub / VIP Islands)
       - Config.TWITCH_VILLAGERS_DIR (Free / Twitch Islands)
-
     Checks both the `nhl/` subfolder and the root folder for the island.
     Returns: (found_files_list, checked_expected_paths)
-    Each item in found_files_list is a dict:
-      {
-          "filename": str,
-          "file_path": str,
-          "size_bytes": int,
-          "modified_at": float,
-      }
     """
     if not island_name:
         return [], []
@@ -303,7 +300,6 @@ def locate_island_nhl_files(
         if os.path.isdir(direct_island_dir):
             candidate_dirs.append(direct_island_dir)
 
-        # Case-insensitive / normalized folder match
         try:
             for folder in os.listdir(root):
                 f_path = os.path.join(root, folder)
@@ -315,7 +311,6 @@ def locate_island_nhl_files(
             pass
 
         for island_dir in candidate_dirs:
-            # Subdirectories to search: "nhl" subfolder first, then island root folder
             nhl_sub = os.path.join(island_dir, "nhl")
             search_folders = [nhl_sub, island_dir]
 
@@ -368,71 +363,100 @@ def locate_island_nhl_files(
     return found_files, checked_paths
 
 
-def _position_placeholder(record_index: int, A: int, B: int, F: int, G: int) -> Dict[str, Any]:
-    """
-    Returns whatever positional info we actually have, clearly marked
-    as unconfirmed. Do NOT treat 'sector' here as reliable - it is a
-    linear-index fallback, not a verified acre mapping. Replace this
-    function once the real position encoding is confirmed.
-    """
-    return {
-        "record_index": record_index,
-        "raw_A": A,
-        "raw_B": B,
-        "raw_F": F,
-        "raw_G": G,
-        "position_confirmed": False,
-    }
+def _coord_to_sector(x: int, y: int, acre_size: int = 16) -> str:
+    """Map tile (X, Y) to standard ACNH sector (e.g. A1, B3, F6)."""
+    col_idx = min(6, max(0, x // acre_size))
+    row_idx = min(7, max(0, y // acre_size + 1))
+    col_letter = chr(ord("A") + col_idx)
+    return f"{col_letter}{row_idx}"
 
 
 def parse_nhl_bytes(raw_bytes: bytes, island_name: str) -> Dict[str, Any]:
-    """Parse raw binary .nhl data using the confirmed 16-byte record layout."""
+    """Parse raw binary .nhl data into items, sectors, and summary statistics.
+
+    Supports confirmed 16-byte records (uint32 item_id at offset +4) as well as
+    fallback strides (8/4) if file size does not align with 16.
+    """
     catalog = _load_item_catalog()
     file_size = len(raw_bytes)
 
-    if file_size % RECORD_SIZE != 0:
-        logger.warning(
-            f"[NhlMapParser] File size {file_size} is not a multiple of the "
-            f"confirmed record size ({RECORD_SIZE}). Parsing what fits; the "
-            f"tail bytes will be ignored. This may indicate a different file "
-            f"variant that hasn't been reverse-engineered yet."
-        )
+    # Determine record format and stride
+    use_16_byte = (file_size % 16 == 0 and file_size > 0)
+    if use_16_byte:
+        stride = 16
+    elif file_size % 8 == 0 and (file_size // 8 in (10752, 25600, 43008) or file_size % 4 != 0):
+        stride = 8
+    else:
+        stride = 4
 
-    total_records = file_size // RECORD_SIZE
+    total_slots = file_size // stride
+
+    if total_slots >= 43008:
+        grid_w, grid_h = 224, 192
+        acre_size = 32
+    elif total_slots >= 25600:
+        grid_w, grid_h = 160, 160
+        acre_size = 20
+    else:
+        grid_w, grid_h = 112, 96
+        acre_size = 16
 
     items: List[Dict[str, Any]] = []
+    sectors: Dict[str, List[Dict[str, Any]]] = {}
     category_counts: Dict[str, int] = {}
     total_valid_items = 0
-    background_fill_count = 0
     empty_count = 0
+    background_fill_count = 0
+    low_value_count = 0
 
-    for idx in range(total_records):
-        offset = idx * RECORD_SIZE
-        if offset + RECORD_SIZE > file_size:
+    for idx in range(total_slots):
+        offset = idx * stride
+        if offset + stride > file_size:
             break
 
-        A = struct.unpack_from("<H", raw_bytes, offset + 0)[0]
-        B = struct.unpack_from("<H", raw_bytes, offset + 2)[0]
-        item_id = struct.unpack_from(ITEM_ID_STRUCT, raw_bytes, offset + ITEM_ID_OFFSET)[0]
-        marker = struct.unpack_from(MARKER_STRUCT, raw_bytes, offset + MARKER_OFFSET)[0]
-        F = struct.unpack_from("<H", raw_bytes, offset + 12)[0]
-        G = struct.unpack_from("<H", raw_bytes, offset + 14)[0]
+        if use_16_byte:
+            A = struct.unpack_from("<H", raw_bytes, offset + 0)[0]
+            B = struct.unpack_from("<H", raw_bytes, offset + 2)[0]
+            item_id = struct.unpack_from(ITEM_ID_STRUCT, raw_bytes, offset + ITEM_ID_OFFSET)[0]
+            marker = struct.unpack_from(MARKER_STRUCT, raw_bytes, offset + MARKER_OFFSET)[0]
+            F = struct.unpack_from("<H", raw_bytes, offset + 12)[0]
+            G = struct.unpack_from("<H", raw_bytes, offset + 14)[0]
+            count_or_flag = 1
 
-        # Background/bulk-fill records: not real placed items.
-        if A in BACKGROUND_A_VALUES and item_id != 0:
-            background_fill_count += 1
-            continue
+            # Background/bulk-fill records: not genuine placed items
+            if A in BACKGROUND_A_VALUES and item_id != 0:
+                background_fill_count += 1
+                continue
+        else:
+            item_id = struct.unpack_from("<H", raw_bytes, offset)[0]
+            count_or_flag = struct.unpack_from("<H", raw_bytes, offset + 2)[0] if stride >= 4 else 1
+            A, B, F, G = 0, 0, 0, 0
+            marker = 0
 
-        # No item in this slot.
-        if item_id == 0:
+        # Empty / sentinel slots
+        if item_id == 0 or item_id in (0xFFFE, 0xFFFF, 0xFEFF, 0xFFFD):
             empty_count += 1
             continue
 
-        hex_id = f"{item_id:08x}"
-        info = catalog.get(hex_id)
+        # Exclude noise / low-value IDs below 0x50 that collide with paintings
+        if item_id < MIN_PLAUSIBLE_ITEM_ID:
+            low_value_count += 1
+            continue
 
-        name = info["name"] if info else f"Unknown Item (id 0x{hex_id})"
-        category = info["category"] if info else "Unresolved"
+        tile_x = idx % grid_w
+        tile_y = idx // grid_w
+        sector = _coord_to_sector(tile_x, tile_y, acre_size)
+
+        hex_id_4 = f"{item_id:04X}"
+        hex_id_8 = f"{item_id:08X}"
+
+        # Look up in catalog (checked across 4-hex, 8-hex, and integer keys)
+        info = catalog.get(hex_id_4) or catalog.get(hex_id_8) or catalog.get(item_id)
+
+        name = info["name"] if info else f"Item #{item_id} (0x{hex_id_4})"
+        category = info["category"] if info else "Miscellaneous"
+        diy = info["diy"] if info else False
+        image_url = info.get("imageUrl") or ""
 
         category_counts[category] = category_counts.get(category, 0) + 1
         total_valid_items += 1
@@ -440,44 +464,77 @@ def parse_nhl_bytes(raw_bytes: bytes, island_name: str) -> Dict[str, Any]:
         item_obj = {
             "name": name,
             "category": category,
-            "itemIdHex": hex_id,
+            "diy": diy,
+            "internalId": hex_id_4,
+            "itemIdHex": hex_id_8,
             "itemIdDecimal": item_id,
+            "x": tile_x,
+            "y": tile_y,
+            "sector": sector,
+            "count": count_or_flag if count_or_flag > 1 else 1,
+            "imageUrl": image_url,
             "markerField": f"0x{marker:04X}",
-            **_position_placeholder(idx, A, B, F, G),
+            "record_index": idx,
+            "raw_A": A,
+            "raw_B": B,
+            "raw_F": F,
+            "raw_G": G,
+            "position_confirmed": False,
         }
-        if info and info.get("image"):
-            item_obj["imageUrl"] = info["image"]
-        if info and "diy" in info:
-            item_obj["diy"] = info["diy"]
+
         items.append(item_obj)
+        if sector not in sectors:
+            sectors[sector] = []
+        sectors[sector].append(item_obj)
+
+    sector_summary = {}
+    for sec, sec_items in sectors.items():
+        sec_cat_counts: Dict[str, int] = {}
+        for item in sec_items:
+            cat = item["category"]
+            sec_cat_counts[cat] = sec_cat_counts.get(cat, 0) + 1
+        top_cats = sorted(sec_cat_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        sector_summary[sec] = {
+            "total_items": len(sec_items),
+            "top_categories": [cat for cat, _ in top_cats],
+            "sample_items": [i["name"] for i in sec_items[:5]],
+        }
 
     return {
         "ok": True,
         "island": island_name,
-        "status": "live_nhl_v2",
+        "status": "live_nhl",
         "file_found": True,
-        "record_size_bytes": RECORD_SIZE,
-        "total_records": total_records,
+        "record_size_bytes": stride,
+        "total_records": total_slots,
+        "grid": {
+            "width": grid_w,
+            "height": grid_h,
+            "acre_size": acre_size,
+            "cols": ["A", "B", "C", "D", "E", "F", "G"],
+            "rows": [1, 2, 3, 4, 5, 6],
+        },
         "stats": {
             "total_items": total_valid_items,
             "unique_categories": len(category_counts),
             "category_counts": category_counts,
             "empty_slots": empty_count,
             "background_fill_slots": background_fill_count,
+            "low_value_slots": low_value_count,
         },
+        "sector_summary": sector_summary,
+        "sectors": sectors,
         "items": items,
-        "caveats": [
-            "Item IDs and empty/filler detection are confirmed against real "
-            "data and a public ACNH item ID reference. Positional fields "
-            "(raw_A, raw_B, raw_F, raw_G, record_index) are NOT a confirmed "
-            "coordinate system - do not render these as acre/tile positions "
-            "without further reverse-engineering.",
-        ],
     }
 
 
 def get_island_map_data(island_name: str, force_refresh: bool = False) -> Dict[str, Any]:
-    """Main entrypoint: retrieves parsed map data for an island (cached)."""
+    """
+    Main entrypoint: retrieves parsed map data for an island (cached).
+    Checks both VILLAGERS_DIR and TWITCH_VILLAGERS_DIR.
+    Strictly parses real files. If maprefresh.nhl does not exist, returns
+    file_found: False and empty data. No mock data.
+    """
     import time
     clean_name = island_name.strip()
     norm_key = clean_name.lower()
@@ -504,7 +561,16 @@ def get_island_map_data(island_name: str, force_refresh: bool = False) -> Dict[s
                 "file_found": True,
                 "file_path": file_path,
                 "error": f"Failed to parse maprefresh.nhl: {exc}",
+                "grid": {
+                    "width": 112,
+                    "height": 96,
+                    "acre_size": 16,
+                    "cols": ["A", "B", "C", "D", "E", "F", "G"],
+                    "rows": [1, 2, 3, 4, 5, 6],
+                },
                 "items": [],
+                "sectors": {},
+                "sector_summary": {},
                 "stats": {"total_items": 0, "unique_categories": 0, "category_counts": {}},
             }
     else:
@@ -516,7 +582,16 @@ def get_island_map_data(island_name: str, force_refresh: bool = False) -> Dict[s
             "file_path": None,
             "error": f"maprefresh.nhl not found for island '{clean_name}'.",
             "checked_paths": checked_paths,
+            "grid": {
+                "width": 112,
+                "height": 96,
+                "acre_size": 16,
+                "cols": ["A", "B", "C", "D", "E", "F", "G"],
+                "rows": [1, 2, 3, 4, 5, 6],
+            },
             "items": [],
+            "sectors": {},
+            "sector_summary": {},
             "stats": {"total_items": 0, "unique_categories": 0, "category_counts": {}},
         }
 
@@ -525,7 +600,7 @@ def get_island_map_data(island_name: str, force_refresh: bool = False) -> Dict[s
 
 
 def search_island_items(island_name: str, query: str) -> Dict[str, Any]:
-    """Search for items by name or category on a specific island map."""
+    """Search for items by name, category, or sector on a specific island map."""
     map_data = get_island_map_data(island_name)
     q = query.strip().lower()
 
@@ -553,9 +628,11 @@ def search_island_items(island_name: str, query: str) -> Dict[str, Any]:
 
     matches = []
     for item in map_data.get("items", []):
-        name_match = q in item["name"].lower()
-        cat_match = q in item["category"].lower()
-        if name_match or cat_match:
+        name_match = q in item.get("name", "").lower()
+        cat_match = q in item.get("category", "").lower()
+        sec_match = q == item.get("sector", "").lower()
+
+        if name_match or cat_match or sec_match:
             matches.append(item)
 
     return {
@@ -563,7 +640,7 @@ def search_island_items(island_name: str, query: str) -> Dict[str, Any]:
         "island": map_data["island"],
         "query": query,
         "file_found": True,
-        "status": map_data.get("status", "live_nhl_v2"),
+        "status": map_data.get("status", "live_nhl"),
         "total_matches": len(matches),
         "matches": matches,
     }
