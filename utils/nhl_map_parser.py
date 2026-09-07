@@ -1,13 +1,28 @@
 """
-NHL Island Map Parser Module
+NHL Island Map Parser Module (v4 - Evidence-Based Multi-Format Detection & Coordinate Resolution)
+
 Locates and parses Animal Crossing: New Horizons .nhl (New Horizons Layer) files:
 Paths checked:
   - VILLAGERS_DIR/<island_name>/nhl/maprefresh.nhl       (VIP / Sub Islands)
   - TWITCH_VILLAGERS_DIR/<island_name>/nhl/maprefresh.nhl (Free / Twitch Islands)
 
-Extracts ground items, coordinates (X, Y), acre sectors (A1..G7), and cross-references
-with the local item catalog (data/acnh.min.json) for names, categories, icons, and search indexing.
-Strictly parses real files only. No mock data.
+Architecture & Design:
+  1. Multi-Format Evidence Detection:
+     Evaluates candidate binary layouts (16-byte uint32 record, 8-byte NHSE item,
+     4-byte compact) against structural markers (0xFFFD, 0xFFFE), catalog hit rates,
+     and valid ID distributions instead of assuming a format based merely on file size divisibility.
+  2. Coordinate Derivation:
+     Evaluates explicit coordinates in record fields vs. row-major linear tile layout.
+     Dynamically computes acre dimensions, columns (A..), rows (1..), and prevents silent clamping.
+  3. Strict Item Validation:
+     Filters low-number noise slots (< 0x50), segregates unconfirmed/unknown IDs into
+     `unknown_records` rather than fabricating item names, and only places confirmed catalog items in `items`.
+  4. MTime & Size Cache Invalidation:
+     Tracks file modification time and file size to automatically invalidate cached map data
+     immediately when the file changes on disk, while preserving `force_refresh=True`.
+  5. Real-File Enforcement & Diagnostics:
+     Strictly parses real files only (no mock data). Provides detailed diagnostics on
+     detected format, confidence score, coordinate strategy, and slot counts.
 """
 
 import os
@@ -15,6 +30,7 @@ import struct
 import json
 import logging
 import re
+import time
 from typing import Dict, List, Optional, Any, Tuple
 
 from utils.config import Config
@@ -22,12 +38,12 @@ from utils.config import Config
 logger = logging.getLogger("NhlMapParser")
 
 _ITEM_CATALOG_CACHE: Optional[Dict[Any, Dict[str, Any]]] = None
-_MAP_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_MAP_CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_TTL_SECONDS = 60.0
 
 # Confirmed 16-byte record layout for real .nhl files:
-#   offset +0 (uint16): A (raw field)
-#   offset +2 (uint16): B (raw field)
+#   offset +0 (uint16): A (raw field / coordinate candidate)
+#   offset +2 (uint16): B (raw field / coordinate candidate)
 #   offset +4 (uint32): item_id (little-endian uint32)
 #   offset +8 (uint16): marker / sentinel field (0xFFFD, 0xFFFE)
 #   offset +10 (uint16): padding / reserved
@@ -112,7 +128,15 @@ def _load_item_catalog() -> Dict[Any, Dict[str, Any]]:
                     continue
                 cat = item.get("sourceSheet") or item.get("category") or item.get("Category") or "Miscellaneous"
                 diy = bool(item.get("diy") or item.get("DIY") == "Yes")
-                image = item.get("image") or ""
+                image = (
+                    item.get("image")
+                    or item.get("storageImage")
+                    or item.get("inventoryImage")
+                    or item.get("closetImage")
+                    or item.get("albumImage")
+                    or item.get("framedImage")
+                    or ""
+                )
 
                 entry = {
                     "name": name,
@@ -131,11 +155,17 @@ def _load_item_catalog() -> Dict[Any, Dict[str, Any]]:
                         if var_name and str(var_name).lower() not in ("na", "none", "")
                         else name
                     )
+                    var_img = (
+                        var.get("image")
+                        or var.get("storageImage")
+                        or var.get("closetImage")
+                        or image
+                    )
                     v_entry = {
                         "name": display_name,
                         "category": cat,
                         "diy": diy,
-                        "imageUrl": var.get("image") or image,
+                        "imageUrl": var_img,
                     }
                     _index_entry(var.get("internalId") or var.get("variantId"), v_entry)
 
@@ -145,7 +175,12 @@ def _load_item_catalog() -> Dict[Any, Dict[str, Any]]:
                 if not c_name:
                     continue
                 c_cat = cr.get("sourceSheet") or "Creatures"
-                c_img = cr.get("iconImage") or cr.get("critterpediaImage") or ""
+                c_img = (
+                    cr.get("iconImage")
+                    or cr.get("critterpediaImage")
+                    or cr.get("furnitureImage")
+                    or ""
+                )
                 _index_entry(
                     cr.get("internalId"),
                     {"name": c_name, "category": c_cat, "diy": False, "imageUrl": c_img},
@@ -363,58 +398,291 @@ def locate_island_nhl_files(
     return found_files, checked_paths
 
 
-def _coord_to_sector(x: int, y: int, acre_size: int = 16) -> str:
-    """Map tile (X, Y) to standard ACNH sector (e.g. A1, B3, F6)."""
-    col_idx = min(6, max(0, x // acre_size))
-    row_idx = min(7, max(0, y // acre_size + 1))
+def _resolve_grid_dimensions(total_slots: int) -> Tuple[int, int, int, List[str], List[int]]:
+    """
+    Dynamically determines grid width, height, acre size, column labels, and row numbers
+    based on standard ACNH acre layouts.
+    """
+    if total_slots >= 55296:      # 9 columns x 6 rows of 32x32 acres
+        grid_w, grid_h, acre_size = 288, 192, 32
+    elif total_slots >= 43008:    # 7 columns x 6 rows of 32x32 acres
+        grid_w, grid_h, acre_size = 224, 192, 32
+    elif total_slots >= 25600:    # 8 columns x 8 rows of 20x20 acres
+        grid_w, grid_h, acre_size = 160, 160, 20
+    elif total_slots >= 13824:    # 9 columns x 6 rows of 16x16 acres
+        grid_w, grid_h, acre_size = 144, 96, 16
+    elif total_slots >= 10752:    # 7 columns x 6 rows of 16x16 acres
+        grid_w, grid_h, acre_size = 112, 96, 16
+    elif total_slots >= 1024:     # 1 single acre of 32x32
+        grid_w, grid_h, acre_size = 32, 32, 32
+    elif total_slots >= 256:      # 1 single acre of 16x16
+        grid_w, grid_h, acre_size = 16, 16, 16
+    else:
+        grid_w, grid_h, acre_size = 112, 96, 16
+
+    num_cols = max(1, grid_w // acre_size)
+    num_rows = max(1, grid_h // acre_size)
+    cols = [chr(ord("A") + c) for c in range(min(num_cols, 26))]
+    rows = [r + 1 for r in range(num_rows)]
+
+    return grid_w, grid_h, acre_size, cols, rows
+
+
+def _coord_to_sector(x: int, y: int, acre_size: int, num_cols: int, num_rows: int) -> str:
+    """
+    Maps tile (X, Y) to standard ACNH sector (e.g. A1, B3, F6).
+    Explicitly handles out-of-bounds coordinates without silent inaccurate clamping.
+    """
+    if acre_size <= 0:
+        acre_size = 16
+
+    col_idx = x // acre_size
+    row_idx = y // acre_size
+
+    if col_idx < 0 or col_idx >= num_cols or row_idx < 0 or row_idx >= num_rows:
+        return "OUT_OF_BOUNDS"
+
     col_letter = chr(ord("A") + col_idx)
-    return f"{col_letter}{row_idx}"
+    row_number = row_idx + 1
+    return f"{col_letter}{row_number}"
+
+
+def _detect_nhl_format(
+    raw_bytes: bytes, catalog: Dict[Any, Dict[str, Any]]
+) -> Tuple[Optional[str], int, float, List[str]]:
+    """
+    Evidence-based format detection. Evaluates multiple candidate record layouts:
+      1. '16_byte_uint32': 16-byte records, uint32 item ID at offset +4, marker at +8
+      2. '8_byte_nhse': 8-byte NHSE items, uint16 item ID at offset +0, FreeParam at +4
+      3. '4_byte_compact': 4-byte records, uint16 item ID at offset +0, count at +2
+
+    Returns: (detected_format_name, record_size, confidence_score, reasons_list)
+    """
+    file_size = len(raw_bytes)
+    if file_size == 0:
+        return None, 0, 0.0, ["File is empty (0 bytes)."]
+
+    candidates = []
+
+    # Candidate 1: 16-byte record layout
+    if file_size >= 16 and file_size % 16 == 0:
+        total = file_size // 16
+        sample_n = min(total, 5000)
+        marker_hits = 0
+        cat_hits = 0
+        valid_items = 0
+        empty_count = 0
+        bg_count = 0
+
+        for i in range(sample_n):
+            off = i * 16
+            A = struct.unpack_from("<H", raw_bytes, off + 0)[0]
+            item_id = struct.unpack_from("<I", raw_bytes, off + 4)[0]
+            marker = struct.unpack_from("<H", raw_bytes, off + 8)[0]
+
+            if marker in KNOWN_MARKER_VALUES:
+                marker_hits += 1
+            if A in BACKGROUND_A_VALUES and item_id != 0:
+                bg_count += 1
+                continue
+            if item_id == 0 or item_id in (0xFFFE, 0xFFFF, 0xFEFF, 0xFFFD):
+                empty_count += 1
+                continue
+            if item_id < MIN_PLAUSIBLE_ITEM_ID:
+                continue
+
+            valid_items += 1
+            h4 = f"{item_id:04X}"
+            h8 = f"{item_id:08X}"
+            if h4 in catalog or h8 in catalog or item_id in catalog:
+                cat_hits += 1
+
+        marker_ratio = marker_hits / sample_n if sample_n else 0
+        hit_ratio = cat_hits / valid_items if valid_items else 0
+        score = 0.0
+        reasons = []
+
+        if marker_ratio >= 0.70:
+            score += 0.45 * marker_ratio
+            reasons.append(f"Marker field (0xFFFD/0xFFFE at +8) consistency: {marker_ratio*100:.1f}%")
+        if valid_items > 0:
+            score += 0.45 * hit_ratio
+            reasons.append(f"Catalog hit rate: {hit_ratio*100:.1f}% ({cat_hits}/{valid_items})")
+        elif (empty_count + bg_count) == sample_n:
+            score += 0.40
+            reasons.append("Valid empty/background map file structure")
+
+        if file_size in (172032, 688128, 409600):
+            score += 0.10
+            reasons.append(f"Known standard island file size ({file_size} bytes)")
+
+        candidates.append(("16_byte_uint32", 16, min(1.0, score), reasons))
+
+    # Candidate 2: 8-byte NHSE layout
+    if file_size >= 8 and file_size % 8 == 0:
+        total = file_size // 8
+        sample_n = min(total, 5000)
+        sentinel_hits = 0
+        cat_hits = 0
+        valid_items = 0
+
+        for i in range(sample_n):
+            off = i * 8
+            item_id = struct.unpack_from("<H", raw_bytes, off + 0)[0]
+            if item_id in (0xFFFE, 0xFFFD, 0x0000):
+                sentinel_hits += 1
+                continue
+            if item_id < MIN_PLAUSIBLE_ITEM_ID:
+                continue
+
+            valid_items += 1
+            h4 = f"{item_id:04X}"
+            if h4 in catalog or item_id in catalog:
+                cat_hits += 1
+
+        sentinel_ratio = sentinel_hits / sample_n if sample_n else 0
+        hit_ratio = cat_hits / valid_items if valid_items else 0
+        score = 0.0
+        reasons = []
+
+        if sentinel_ratio >= 0.60:
+            score += 0.35 * sentinel_ratio
+            reasons.append(f"NHSE sentinel (0xFFFE/0xFFFD at +0) consistency: {sentinel_ratio*100:.1f}%")
+        if valid_items > 0:
+            score += 0.45 * hit_ratio
+            reasons.append(f"Catalog hit rate: {hit_ratio*100:.1f}% ({cat_hits}/{valid_items})")
+
+        if file_size in (344064, 442368, 8192):
+            score += 0.20
+            reasons.append(f"Known NHSE layer dump size ({file_size} bytes)")
+
+        candidates.append(("8_byte_nhse", 8, min(1.0, score), reasons))
+
+    # Candidate 3: 4-byte compact layout
+    if file_size >= 4 and file_size % 4 == 0:
+        total = file_size // 4
+        sample_n = min(total, 5000)
+        cat_hits = 0
+        valid_items = 0
+
+        for i in range(sample_n):
+            off = i * 4
+            item_id = struct.unpack_from("<H", raw_bytes, off + 0)[0]
+            if item_id in (0x0000, 0xFFFE, 0xFFFF, 0xFEFF):
+                continue
+            if item_id < MIN_PLAUSIBLE_ITEM_ID:
+                continue
+
+            valid_items += 1
+            h4 = f"{item_id:04X}"
+            if h4 in catalog or item_id in catalog:
+                cat_hits += 1
+
+        hit_ratio = cat_hits / valid_items if valid_items else 0
+        score = 0.35 * hit_ratio if valid_items > 0 else 0.10
+        reasons = [f"Catalog hit rate: {hit_ratio*100:.1f}% ({cat_hits}/{valid_items})"] if valid_items > 0 else []
+        candidates.append(("4_byte_compact", 4, min(1.0, score), reasons))
+
+    if not candidates:
+        return None, 0, 0.0, [f"File size {file_size} does not match any plausible record alignment."]
+
+    # Select best candidate by score
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    best_fmt, best_stride, best_score, best_reasons = candidates[0]
+
+    if best_score < 0.25:
+        return None, 0, best_score, [
+            f"Candidate {best_fmt} failed confidence threshold ({best_score:.2f} < 0.25).",
+            *best_reasons,
+        ]
+
+    return best_fmt, best_stride, best_score, best_reasons
 
 
 def parse_nhl_bytes(raw_bytes: bytes, island_name: str) -> Dict[str, Any]:
-    """Parse raw binary .nhl data into items, sectors, and summary statistics.
-
-    Supports confirmed 16-byte records (uint32 item_id at offset +4) as well as
-    fallback strides (8/4) if file size does not align with 16.
+    """
+    Parse raw binary .nhl data into confirmed items, coordinates, sectors, and summary statistics.
+    Evidence-based format detection prevents misclassification and excludes false items.
     """
     catalog = _load_item_catalog()
     file_size = len(raw_bytes)
 
-    # Determine record format and stride
-    use_16_byte = (file_size % 16 == 0 and file_size > 0)
-    if use_16_byte:
-        stride = 16
-    elif file_size % 8 == 0 and (file_size // 8 in (10752, 25600, 43008) or file_size % 4 != 0):
-        stride = 8
-    else:
-        stride = 4
+    if file_size == 0:
+        return {
+            "ok": False,
+            "island": island_name,
+            "status": "error",
+            "file_found": True,
+            "error": "NHL file is empty (0 bytes).",
+            "items": [],
+            "sectors": {},
+            "sector_summary": {},
+            "stats": {"total_items": 0, "unique_categories": 0, "category_counts": {}},
+        }
+
+    # 1. Detect format using evidence
+    detected_fmt, stride, confidence, reasons = _detect_nhl_format(raw_bytes, catalog)
+
+    if not detected_fmt or stride <= 0:
+        logger.warning(
+            f"[NhlMapParser] Failed to detect valid format for {island_name} ({file_size} bytes): {reasons}"
+        )
+        return {
+            "ok": False,
+            "island": island_name,
+            "status": "error",
+            "file_found": True,
+            "error": f"Unrecognized NHL binary format: {'; '.join(reasons)}",
+            "file_size": file_size,
+            "items": [],
+            "sectors": {},
+            "sector_summary": {},
+            "stats": {"total_items": 0, "unique_categories": 0, "category_counts": {}},
+        }
+
+    logger.info(
+        f"[NhlMapParser] Detected format '{detected_fmt}' (stride={stride}, confidence={confidence*100:.1f}%) for {island_name}."
+    )
 
     total_slots = file_size // stride
+    grid_w, grid_h, acre_size, cols, rows = _resolve_grid_dimensions(total_slots)
+    num_cols = len(cols)
+    num_rows = len(rows)
 
-    if total_slots >= 43008:
-        grid_w, grid_h = 224, 192
-        acre_size = 32
-    elif total_slots >= 25600:
-        grid_w, grid_h = 160, 160
-        acre_size = 20
-    else:
-        grid_w, grid_h = 112, 96
-        acre_size = 16
+    # 2. Coordinate strategy analysis
+    # Inspect whether record fields A/B provide explicit in-bounds coordinates for valid items
+    coordinate_strategy = "linear_grid_row_major"
+    if detected_fmt == "16_byte_uint32" and total_slots > 0:
+        sample_coords = []
+        for i in range(min(total_slots, 1000)):
+            off = i * 16
+            A = struct.unpack_from("<H", raw_bytes, off + 0)[0]
+            B = struct.unpack_from("<H", raw_bytes, off + 2)[0]
+            item_id = struct.unpack_from("<I", raw_bytes, off + 4)[0]
+            if A not in BACKGROUND_A_VALUES and item_id >= MIN_PLAUSIBLE_ITEM_ID:
+                sample_coords.append((A, B))
+
+        if len(sample_coords) >= 10:
+            in_bounds_ab = sum(1 for (a, b) in sample_coords if 0 <= a < grid_w and 0 <= b < grid_h)
+            if in_bounds_ab / len(sample_coords) >= 0.95 and len(set(sample_coords)) >= len(sample_coords) * 0.80:
+                coordinate_strategy = "explicit_record_ab"
 
     items: List[Dict[str, Any]] = []
+    unknown_records: List[Dict[str, Any]] = []
     sectors: Dict[str, List[Dict[str, Any]]] = {}
     category_counts: Dict[str, int] = {}
     total_valid_items = 0
     empty_count = 0
     background_fill_count = 0
     low_value_count = 0
+    unresolved_nonzero_count = 0
 
     for idx in range(total_slots):
         offset = idx * stride
         if offset + stride > file_size:
             break
 
-        if use_16_byte:
+        if detected_fmt == "16_byte_uint32":
             A = struct.unpack_from("<H", raw_bytes, offset + 0)[0]
             B = struct.unpack_from("<H", raw_bytes, offset + 2)[0]
             item_id = struct.unpack_from(ITEM_ID_STRUCT, raw_bytes, offset + ITEM_ID_OFFSET)[0]
@@ -423,13 +691,17 @@ def parse_nhl_bytes(raw_bytes: bytes, island_name: str) -> Dict[str, Any]:
             G = struct.unpack_from("<H", raw_bytes, offset + 14)[0]
             count_or_flag = 1
 
-            # Background/bulk-fill records: not genuine placed items
             if A in BACKGROUND_A_VALUES and item_id != 0:
                 background_fill_count += 1
                 continue
-        else:
-            item_id = struct.unpack_from("<H", raw_bytes, offset)[0]
-            count_or_flag = struct.unpack_from("<H", raw_bytes, offset + 2)[0] if stride >= 4 else 1
+        elif detected_fmt == "8_byte_nhse":
+            item_id = struct.unpack_from("<H", raw_bytes, offset + 0)[0]
+            count_or_flag = 1
+            A, B, F, G = 0, 0, 0, 0
+            marker = 0
+        else:  # 4_byte_compact
+            item_id = struct.unpack_from("<H", raw_bytes, offset + 0)[0]
+            count_or_flag = struct.unpack_from("<H", raw_bytes, offset + 2)[0]
             A, B, F, G = 0, 0, 0, 0
             marker = 0
 
@@ -443,20 +715,40 @@ def parse_nhl_bytes(raw_bytes: bytes, island_name: str) -> Dict[str, Any]:
             low_value_count += 1
             continue
 
-        tile_x = idx % grid_w
-        tile_y = idx // grid_w
-        sector = _coord_to_sector(tile_x, tile_y, acre_size)
+        # Derive coordinates
+        if coordinate_strategy == "explicit_record_ab":
+            tile_x = A
+            tile_y = B
+        else:
+            tile_x = idx % grid_w
+            tile_y = idx // grid_w
+
+        sector = _coord_to_sector(tile_x, tile_y, acre_size, num_cols, num_rows)
 
         hex_id_4 = f"{item_id:04X}"
         hex_id_8 = f"{item_id:08X}"
 
-        # Look up in catalog (checked across 4-hex, 8-hex, and integer keys)
+        # Look up in catalog
         info = catalog.get(hex_id_4) or catalog.get(hex_id_8) or catalog.get(item_id)
 
-        name = info["name"] if info else f"Item #{item_id} (0x{hex_id_4})"
-        category = info["category"] if info else "Miscellaneous"
-        diy = info["diy"] if info else False
-        image_url = info.get("imageUrl") or ""
+        if not info:
+            unresolved_nonzero_count += 1
+            unknown_records.append({
+                "record_index": idx,
+                "itemIdDecimal": item_id,
+                "itemIdHex": hex_id_8,
+                "x": tile_x,
+                "y": tile_y,
+                "sector": sector,
+                "raw_A": A,
+                "raw_B": B,
+            })
+            continue
+
+        name = info["name"]
+        category = info.get("category") or "Miscellaneous"
+        diy = info.get("diy") or False
+        image_url = info.get("imageUrl", "")
 
         category_counts[category] = category_counts.get(category, 0) + 1
         total_valid_items += 1
@@ -479,7 +771,7 @@ def parse_nhl_bytes(raw_bytes: bytes, island_name: str) -> Dict[str, Any]:
             "raw_B": B,
             "raw_F": F,
             "raw_G": G,
-            "position_confirmed": False,
+            "position_confirmed": (coordinate_strategy == "explicit_record_ab"),
         }
 
         items.append(item_obj)
@@ -500,6 +792,9 @@ def parse_nhl_bytes(raw_bytes: bytes, island_name: str) -> Dict[str, Any]:
             "sample_items": [i["name"] for i in sec_items[:5]],
         }
 
+    total_resolved = total_valid_items + unresolved_nonzero_count
+    resolution_rate = (total_valid_items / total_resolved) if total_resolved > 0 else 1.0
+
     return {
         "ok": True,
         "island": island_name,
@@ -507,12 +802,19 @@ def parse_nhl_bytes(raw_bytes: bytes, island_name: str) -> Dict[str, Any]:
         "file_found": True,
         "record_size_bytes": stride,
         "total_records": total_slots,
+        "diagnostics": {
+            "detected_format": detected_fmt,
+            "confidence": round(confidence, 3),
+            "format_reasons": reasons,
+            "coordinate_strategy": coordinate_strategy,
+            "file_size_bytes": file_size,
+        },
         "grid": {
             "width": grid_w,
             "height": grid_h,
             "acre_size": acre_size,
-            "cols": ["A", "B", "C", "D", "E", "F", "G"],
-            "rows": [1, 2, 3, 4, 5, 6],
+            "cols": cols,
+            "rows": rows,
         },
         "stats": {
             "total_items": total_valid_items,
@@ -521,60 +823,30 @@ def parse_nhl_bytes(raw_bytes: bytes, island_name: str) -> Dict[str, Any]:
             "empty_slots": empty_count,
             "background_fill_slots": background_fill_count,
             "low_value_slots": low_value_count,
+            "unknown_id_slots": unresolved_nonzero_count,
+            "catalog_resolution_rate": round(resolution_rate, 3),
         },
         "sector_summary": sector_summary,
         "sectors": sectors,
         "items": items,
+        "unknown_records": unknown_records[:100],  # capped sample for diagnostic inspection
     }
 
 
 def get_island_map_data(island_name: str, force_refresh: bool = False) -> Dict[str, Any]:
     """
-    Main entrypoint: retrieves parsed map data for an island (cached).
-    Checks both VILLAGERS_DIR and TWITCH_VILLAGERS_DIR.
-    Strictly parses real files. If maprefresh.nhl does not exist, returns
-    file_found: False and empty data. No mock data.
+    Main entrypoint: retrieves parsed map data for an island.
+    Uses file mtime and file size validation to automatically invalidate cached data
+    when maprefresh.nhl changes on disk. Respects force_refresh=True.
+    Strictly parses real files only. Never creates mock data.
     """
-    import time
     clean_name = island_name.strip()
     norm_key = clean_name.lower()
 
-    if not force_refresh and norm_key in _MAP_CACHE:
-        cache_time, cached_data = _MAP_CACHE[norm_key]
-        if time.time() - cache_time < _CACHE_TTL_SECONDS:
-            return cached_data
-
     file_path, file_exists, checked_paths = locate_nhl_file(clean_name)
 
-    if file_exists and file_path and os.path.isfile(file_path):
-        try:
-            with open(file_path, "rb") as f:
-                raw_bytes = f.read()
-            parsed = parse_nhl_bytes(raw_bytes, clean_name)
-            parsed["file_path"] = file_path
-        except Exception as exc:
-            logger.error(f"[NhlMapParser] Error parsing {file_path}: {exc}")
-            parsed = {
-                "ok": False,
-                "island": clean_name,
-                "status": "error",
-                "file_found": True,
-                "file_path": file_path,
-                "error": f"Failed to parse maprefresh.nhl: {exc}",
-                "grid": {
-                    "width": 112,
-                    "height": 96,
-                    "acre_size": 16,
-                    "cols": ["A", "B", "C", "D", "E", "F", "G"],
-                    "rows": [1, 2, 3, 4, 5, 6],
-                },
-                "items": [],
-                "sectors": {},
-                "sector_summary": {},
-                "stats": {"total_items": 0, "unique_categories": 0, "category_counts": {}},
-            }
-    else:
-        parsed = {
+    if not file_exists or not file_path or not os.path.isfile(file_path):
+        return {
             "ok": False,
             "island": clean_name,
             "status": "not_found",
@@ -595,8 +867,55 @@ def get_island_map_data(island_name: str, force_refresh: bool = False) -> Dict[s
             "stats": {"total_items": 0, "unique_categories": 0, "category_counts": {}},
         }
 
-    _MAP_CACHE[norm_key] = (time.time(), parsed)
-    return parsed
+    try:
+        stat = os.stat(file_path)
+        cur_mtime = stat.st_mtime
+        cur_size = stat.st_size
+
+        if not force_refresh and norm_key in _MAP_CACHE:
+            cached_entry = _MAP_CACHE[norm_key]
+            if (
+                cached_entry.get("mtime") == cur_mtime
+                and cached_entry.get("file_size") == cur_size
+                and (time.time() - cached_entry.get("cached_at", 0) < _CACHE_TTL_SECONDS)
+            ):
+                return cached_entry["data"]
+
+        with open(file_path, "rb") as f:
+            raw_bytes = f.read()
+
+        parsed = parse_nhl_bytes(raw_bytes, clean_name)
+        parsed["file_path"] = file_path
+
+        _MAP_CACHE[norm_key] = {
+            "mtime": cur_mtime,
+            "file_size": cur_size,
+            "cached_at": time.time(),
+            "data": parsed,
+        }
+        return parsed
+
+    except Exception as exc:
+        logger.error(f"[NhlMapParser] Error parsing {file_path}: {exc}")
+        return {
+            "ok": False,
+            "island": clean_name,
+            "status": "error",
+            "file_found": True,
+            "file_path": file_path,
+            "error": f"Failed to parse maprefresh.nhl: {exc}",
+            "grid": {
+                "width": 112,
+                "height": 96,
+                "acre_size": 16,
+                "cols": ["A", "B", "C", "D", "E", "F", "G"],
+                "rows": [1, 2, 3, 4, 5, 6],
+            },
+            "items": [],
+            "sectors": {},
+            "sector_summary": {},
+            "stats": {"total_items": 0, "unique_categories": 0, "category_counts": {}},
+        }
 
 
 def search_island_items(island_name: str, query: str) -> Dict[str, Any]:
