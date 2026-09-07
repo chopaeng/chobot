@@ -1,13 +1,47 @@
 """
-NHL Island Map Parser Module
-Locates and parses Animal Crossing: New Horizons .nhl (New Horizons Layer) files:
-Paths checked:
-  - VILLAGERS_DIR/<island_name>/nhl/maprefresh.nhl       (VIP / Sub Islands)
-  - TWITCH_VILLAGERS_DIR/<island_name>/nhl/maprefresh.nhl (Free / Twitch Islands)
+NHL Island Map Parser Module (v2 - rebuilt from actual byte-level evidence)
 
-Extracts ground items, coordinates (X, Y), acre sectors (A1..G7), and cross-references
-with the local item catalog for names, categories, icons, and search indexing.
-Strictly parses real files only. No mock data.
+This replaces the original stride-guessing parser, which was based on
+assumptions that did not match the real file. What changed and why:
+
+CONFIRMED (verified against a real maprefresh.nhl file + a public ACNH
+item ID reference table):
+  - The real record size is 16 bytes, not a guessed 4 or 8.
+  - The item ID lives in a 4-byte little-endian uint32 at offset +4,
+    NOT a uint16 at offset +0. This was confirmed by an exact match:
+    decimal 224 (0x000000E0) corresponds to the real item "spino tail"
+    (Fossil_00224) in a public ACNH item ID table.
+  - offset +8 (uint16) is a marker/sentinel field, not part of the item
+    ID. It takes only two observed values across the whole file:
+    0xFFFD and 0xFFFE. The old code's stride=8 guess read this field as
+    if it were an item ID every other slot, which is why ~76% of
+    "items" it reported were a single fake repeated value.
+
+STILL UNRESOLVED - do not trust for spatial placement:
+  - offset +0 (A) and offset +2 (B) do not have a confirmed meaning.
+    They looked like a tile-index + 32-unit sub-offset pair in one
+    region of the file, but a second region (large runs of A=0xFFFD)
+    breaks that pattern. This looks like the file mixes genuine
+    placed-item records with a separate bulk/background-fill pattern,
+    and untangling those fully needs either the actual NHSE source
+    (MainFieldItem struct) or a known ground-truth item+location to
+    triangulate against.
+  - offset +12 (F) and +14 (G) are carried through as raw fields for
+    future analysis; F often (not always) equals A, and G is mostly
+    256/257 with rarer values that look like packed flag bytes.
+
+Because of the above, this version:
+  - Correctly extracts item IDs and correctly identifies real vs.
+    empty/filler slots (huge accuracy win over v1).
+  - Does NOT claim a reliable acre/sector/(x,y) position for each item.
+    It reports the raw record index and raw A/B/F/G fields alongside
+    each item instead, clearly labeled as "unconfirmed position data",
+    so nothing downstream silently trusts a guessed coordinate.
+
+If/when the real position encoding is figured out (e.g. against a
+known item + known location, or the actual NHSE struct), replace
+`_position_placeholder()` with the real mapping and drop the caveat
+fields.
 """
 
 import os
@@ -25,103 +59,180 @@ _ITEM_CATALOG_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 _MAP_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _CACHE_TTL_SECONDS = 60.0
 
+RECORD_SIZE = 16          # confirmed
+ITEM_ID_OFFSET = 4        # confirmed: uint32 LE
+ITEM_ID_STRUCT = "<I"
+MARKER_OFFSET = 8         # confirmed: uint16, sentinel/marker field
+MARKER_STRUCT = "<H"
+# The only two marker values observed in a real file. Records carrying
+# these are background/filler, not real item IDs. If a future file
+# shows different marker values, this set needs updating.
+KNOWN_MARKER_VALUES = {0xFFFD, 0xFFFE}
+
+# offset 0 (A) values that mark a record as part of the bulk/background
+# fill pattern rather than a genuine placed-item candidate. This is a
+# heuristic based on observed data, NOT a confirmed spec.
+BACKGROUND_A_VALUES = {0xFFFD, 0xFFFE}
+
 
 def _load_item_catalog() -> Dict[str, Dict[str, Any]]:
-    """Load items_detail.json / acnh.json once into a fast hex-ID lookup table."""
+    """Load items from data/acnh.min.json (or fallback items_detail.json / acnh.json)
+    into a fast 8-hex-digit ID lookup table.
+
+    ACNH item IDs are stored as 32-bit integers (e.g. 224 for 'spino tail', hex 0x000000E0).
+    We index items, variations, creatures, and recipes by 8-hex-digit lowercase strings.
+    """
     global _ITEM_CATALOG_CACHE
     if _ITEM_CATALOG_CACHE is not None:
         return _ITEM_CATALOG_CACHE
 
     catalog: Dict[str, Dict[str, Any]] = {}
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    items_path = os.path.join(base_dir, "items_detail.json")
 
-    if not os.path.exists(items_path):
-        items_path = os.path.join(base_dir, "acnh.json")
+    # Primary source: data/acnh.min.json
+    primary_path = os.path.join(base_dir, "data", "acnh.min.json")
+    items_path = primary_path if os.path.exists(primary_path) else None
 
-    if os.path.exists(items_path):
+    if not items_path:
+        for fallback in ["items_detail.json", "acnh.json"]:
+            cand = os.path.join(base_dir, fallback)
+            if os.path.exists(cand):
+                items_path = cand
+                break
+
+    if not items_path:
+        logger.warning("[NhlMapParser] No catalog JSON file found.")
+        _ITEM_CATALOG_CACHE = catalog
+        return catalog
+
+    def _to_hex8(val: Any) -> Optional[str]:
+        if val is None:
+            return None
         try:
-            with open(items_path, "r", encoding="utf-8", errors="ignore") as f:
-                data = json.load(f)
-                items_list = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                for item in items_list:
-                    raw_id = item.get("Internal ID") or item.get("pokerId") or item.get("id")
-                    name = item.get("Name")
-                    if not raw_id or not name:
-                        continue
+            if isinstance(val, int):
+                return f"{val:08x}"
+            s = str(val).strip()
+            if s.startswith(("0x", "0X")):
+                return f"{int(s, 16):08x}"
+            if s.isdigit():
+                return f"{int(s):08x}"
+            return f"{int(s, 16):08x}"
+        except Exception:
+            return None
 
-                    hex_key = str(raw_id).strip().upper()
-                    if len(hex_key) < 4:
-                        hex_key = hex_key.zfill(4)
+    try:
+        with open(items_path, "r", encoding="utf-8", errors="ignore") as f:
+            data = json.load(f)
 
-                    image_url = ""
-                    variations = item.get("Variations")
-                    if isinstance(variations, list) and len(variations) > 0:
-                        image_url = variations[0].get("imageUrl") or ""
+        if isinstance(data, dict) and "items" in data and ("creatures" in data or "recipes" in data):
+            # Comprehensive acnh.min.json format
+            # 1. Base items and variations
+            for item in data.get("items", []):
+                name = item.get("name") or item.get("Name")
+                if not name:
+                    continue
+                cat = item.get("sourceSheet") or item.get("category") or item.get("Category") or "Miscellaneous"
+                diy = bool(item.get("diy") or item.get("DIY") == "Yes")
+                image = item.get("image") or ""
 
-                    entry = {
+                top_id = _to_hex8(item.get("internalId") or item.get("Internal ID") or item.get("id"))
+                if top_id and top_id not in catalog:
+                    catalog[top_id] = {
                         "name": name,
-                        "category": item.get("Category", "Miscellaneous"),
-                        "diy": item.get("DIY") == "Yes",
-                        "imageUrl": image_url,
-                        "internalId": hex_key,
-                        "tag": item.get("ItemTag", ""),
+                        "category": cat,
+                        "diy": diy,
+                        "internalId": top_id,
+                        "image": image,
                     }
-                    catalog[hex_key] = entry
 
-                    if isinstance(variations, list):
-                        for var in variations:
-                            var_poker = var.get("pokerId")
-                            if var_poker:
-                                var_hex = str(var_poker).strip().upper().zfill(4)
-                                if var_hex not in catalog:
-                                    catalog[var_hex] = {
-                                        **entry,
-                                        "imageUrl": var.get("imageUrl") or image_url,
-                                        "internalId": var_hex,
-                                    }
-            logger.info(f"[NhlMapParser] Loaded {len(catalog)} item definitions from catalog.")
-        except Exception as exc:
-            logger.error(f"[NhlMapParser] Failed to load catalog: {exc}")
+                # Variations (different colors, etc.)
+                for var in item.get("variations", []) or []:
+                    var_id = _to_hex8(var.get("internalId") or var.get("variantId"))
+                    if var_id and var_id not in catalog:
+                        var_name = var.get("variation")
+                        display_name = f"{name} ({var_name})" if var_name and str(var_name).lower() not in ("na", "none", "") else name
+                        catalog[var_id] = {
+                            "name": display_name,
+                            "category": cat,
+                            "diy": diy,
+                            "internalId": var_id,
+                            "image": var.get("image") or image,
+                        }
+
+            # 2. Creatures (fish, bugs, sea creatures)
+            for cr in data.get("creatures", []):
+                c_name = cr.get("name")
+                c_id = _to_hex8(cr.get("internalId"))
+                if c_name and c_id and c_id not in catalog:
+                    catalog[c_id] = {
+                        "name": c_name,
+                        "category": cr.get("sourceSheet") or "Creatures",
+                        "diy": False,
+                        "internalId": c_id,
+                        "image": cr.get("iconImage") or cr.get("critterpediaImage") or "",
+                    }
+
+            # 3. Recipes
+            for rec in data.get("recipes", []):
+                r_name = rec.get("name")
+                r_id = _to_hex8(rec.get("internalId"))
+                if r_name and r_id and r_id not in catalog:
+                    catalog[r_id] = {
+                        "name": f"{r_name} (DIY Recipe)",
+                        "category": "Recipes",
+                        "diy": True,
+                        "internalId": r_id,
+                        "image": rec.get("image") or rec.get("imageSh") or "",
+                    }
+
+        else:
+            # Fallback legacy items_detail.json / acnh.json list or dict
+            items_list = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            for item in items_list:
+                raw_id = item.get("Internal ID") or item.get("pokerId") or item.get("id") or item.get("internalId") or item.get("hexstr")
+                name = item.get("Name") or item.get("name")
+                if not raw_id or not name:
+                    continue
+                hex_key = _to_hex8(raw_id)
+                if not hex_key:
+                    continue
+                catalog[hex_key] = {
+                    "name": name,
+                    "category": item.get("Category", item.get("category", "Miscellaneous")),
+                    "diy": item.get("DIY") == "Yes",
+                    "internalId": hex_key,
+                    "image": item.get("image") or "",
+                }
+
+        logger.info(f"[NhlMapParser] Loaded {len(catalog)} item definitions from {items_path}.")
+    except Exception as exc:
+        logger.error(f"[NhlMapParser] Failed to load catalog from {items_path}: {exc}")
 
     _ITEM_CATALOG_CACHE = catalog
     return catalog
 
 
 def locate_nhl_file(island_name: str) -> Tuple[Optional[str], bool, List[str]]:
-    """
-    Locates the maprefresh.nhl file for an island across both:
-      - Config.VILLAGERS_DIR (Sub / VIP Islands)
-      - Config.TWITCH_VILLAGERS_DIR (Free / Twitch Islands)
-    Returns: (found_path, file_exists, checked_expected_paths)
-    """
+    """Locates the maprefresh.nhl file for an island. Unchanged from v1 -
+    this part was never in question, only the byte parsing was wrong."""
     if not island_name:
         return None, False, []
 
     clean_name = island_name.strip()
     norm_name = re.sub(r"[^a-zA-Z0-9]", "", clean_name).lower()
 
-    search_roots = [
-        Config.VILLAGERS_DIR,
-        Config.TWITCH_VILLAGERS_DIR,
-    ]
-
+    search_roots = [Config.VILLAGERS_DIR, Config.TWITCH_VILLAGERS_DIR]
     checked_paths: List[str] = []
 
     for root in search_roots:
         if not root:
             continue
-
         direct_path = os.path.join(root, clean_name, "nhl", "maprefresh.nhl")
         checked_paths.append(direct_path)
-
         if not os.path.exists(root):
             continue
-
         if os.path.isfile(direct_path):
             return direct_path, True, checked_paths
-
-        # Case-insensitive folder search
         try:
             for folder in os.listdir(root):
                 f_path = os.path.join(root, folder)
@@ -257,67 +368,71 @@ def locate_island_nhl_files(
     return found_files, checked_paths
 
 
-def _coord_to_sector(x: int, y: int, acre_size: int = 16) -> str:
-    """Map tile (X, Y) to standard ACNH sector (e.g. A1, B3, F6)."""
-    col_idx = min(6, max(0, x // acre_size))
-    row_idx = min(7, max(0, y // acre_size + 1))
-    col_letter = chr(ord("A") + col_idx)
-    return f"{col_letter}{row_idx}"
+def _position_placeholder(record_index: int, A: int, B: int, F: int, G: int) -> Dict[str, Any]:
+    """
+    Returns whatever positional info we actually have, clearly marked
+    as unconfirmed. Do NOT treat 'sector' here as reliable - it is a
+    linear-index fallback, not a verified acre mapping. Replace this
+    function once the real position encoding is confirmed.
+    """
+    return {
+        "record_index": record_index,
+        "raw_A": A,
+        "raw_B": B,
+        "raw_F": F,
+        "raw_G": G,
+        "position_confirmed": False,
+    }
 
 
 def parse_nhl_bytes(raw_bytes: bytes, island_name: str) -> Dict[str, Any]:
-    """Parse raw binary .nhl data into items, sectors, and summary statistics."""
+    """Parse raw binary .nhl data using the confirmed 16-byte record layout."""
     catalog = _load_item_catalog()
     file_size = len(raw_bytes)
 
-    if file_size % 8 == 0 and (file_size // 8 in (10752, 25600, 43008) or file_size % 4 != 0):
-        stride = 8
-    else:
-        stride = 4
+    if file_size % RECORD_SIZE != 0:
+        logger.warning(
+            f"[NhlMapParser] File size {file_size} is not a multiple of the "
+            f"confirmed record size ({RECORD_SIZE}). Parsing what fits; the "
+            f"tail bytes will be ignored. This may indicate a different file "
+            f"variant that hasn't been reverse-engineered yet."
+        )
 
-    total_slots = file_size // stride
-
-    if total_slots >= 43008:
-        grid_w, grid_h = 224, 192
-        acre_size = 32
-    elif total_slots >= 25600:
-        grid_w, grid_h = 160, 160
-        acre_size = 20
-    else:
-        grid_w, grid_h = 112, 96
-        acre_size = 16
+    total_records = file_size // RECORD_SIZE
 
     items: List[Dict[str, Any]] = []
-    sectors: Dict[str, List[Dict[str, Any]]] = {}
     category_counts: Dict[str, int] = {}
     total_valid_items = 0
+    background_fill_count = 0
+    empty_count = 0
 
-    for idx in range(total_slots):
-        offset = idx * stride
-        if offset + 2 > file_size:
+    for idx in range(total_records):
+        offset = idx * RECORD_SIZE
+        if offset + RECORD_SIZE > file_size:
             break
 
-        item_id = struct.unpack_from("<H", raw_bytes, offset)[0]
+        A = struct.unpack_from("<H", raw_bytes, offset + 0)[0]
+        B = struct.unpack_from("<H", raw_bytes, offset + 2)[0]
+        item_id = struct.unpack_from(ITEM_ID_STRUCT, raw_bytes, offset + ITEM_ID_OFFSET)[0]
+        marker = struct.unpack_from(MARKER_STRUCT, raw_bytes, offset + MARKER_OFFSET)[0]
+        F = struct.unpack_from("<H", raw_bytes, offset + 12)[0]
+        G = struct.unpack_from("<H", raw_bytes, offset + 14)[0]
 
-        # 0x0000 = Empty, 0xFFFE/0xFFFF = Ignored/Void
-        if item_id in (0x0000, 0xFFFE, 0xFFFF, 0xFEFF):
+        # Background/bulk-fill records: not real placed items.
+        if A in BACKGROUND_A_VALUES and item_id != 0:
+            background_fill_count += 1
             continue
 
-        count_or_flag = 1
-        if stride >= 4 and offset + 4 <= file_size:
-            count_or_flag = struct.unpack_from("<H", raw_bytes, offset + 2)[0]
+        # No item in this slot.
+        if item_id == 0:
+            empty_count += 1
+            continue
 
-        tile_x = idx % grid_w
-        tile_y = idx // grid_w
-        sector = _coord_to_sector(tile_x, tile_y, acre_size)
-
-        hex_id = f"{item_id:04X}"
+        hex_id = f"{item_id:08x}"
         info = catalog.get(hex_id)
 
-        name = info["name"] if info else f"Item #{item_id} (0x{hex_id})"
-        category = info["category"] if info else "Miscellaneous"
-        diy = info["diy"] if info else False
-        image_url = info["imageUrl"] if info else ""
+        name = info["name"] if info else f"Unknown Item (id 0x{hex_id})"
+        category = info["category"] if info else "Unresolved"
 
         category_counts[category] = category_counts.get(category, 0) + 1
         total_valid_items += 1
@@ -325,63 +440,44 @@ def parse_nhl_bytes(raw_bytes: bytes, island_name: str) -> Dict[str, Any]:
         item_obj = {
             "name": name,
             "category": category,
-            "diy": diy,
-            "internalId": hex_id,
-            "x": tile_x,
-            "y": tile_y,
-            "sector": sector,
-            "count": count_or_flag if count_or_flag > 1 else 1,
-            "imageUrl": image_url,
+            "itemIdHex": hex_id,
+            "itemIdDecimal": item_id,
+            "markerField": f"0x{marker:04X}",
+            **_position_placeholder(idx, A, B, F, G),
         }
-
+        if info and info.get("image"):
+            item_obj["imageUrl"] = info["image"]
+        if info and "diy" in info:
+            item_obj["diy"] = info["diy"]
         items.append(item_obj)
-        if sector not in sectors:
-            sectors[sector] = []
-        sectors[sector].append(item_obj)
-
-    sector_summary = {}
-    for sec, sec_items in sectors.items():
-        sec_cat_counts: Dict[str, int] = {}
-        for item in sec_items:
-            cat = item["category"]
-            sec_cat_counts[cat] = sec_cat_counts.get(cat, 0) + 1
-        top_cats = sorted(sec_cat_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        sector_summary[sec] = {
-            "total_items": len(sec_items),
-            "top_categories": [cat for cat, _ in top_cats],
-            "sample_items": [i["name"] for i in sec_items[:5]],
-        }
 
     return {
         "ok": True,
         "island": island_name,
-        "status": "live_nhl",
+        "status": "live_nhl_v2",
         "file_found": True,
-        "grid": {
-            "width": grid_w,
-            "height": grid_h,
-            "acre_size": acre_size,
-            "cols": ["A", "B", "C", "D", "E", "F", "G"],
-            "rows": [1, 2, 3, 4, 5, 6],
-        },
+        "record_size_bytes": RECORD_SIZE,
+        "total_records": total_records,
         "stats": {
             "total_items": total_valid_items,
             "unique_categories": len(category_counts),
             "category_counts": category_counts,
+            "empty_slots": empty_count,
+            "background_fill_slots": background_fill_count,
         },
-        "sector_summary": sector_summary,
-        "sectors": sectors,
         "items": items,
+        "caveats": [
+            "Item IDs and empty/filler detection are confirmed against real "
+            "data and a public ACNH item ID reference. Positional fields "
+            "(raw_A, raw_B, raw_F, raw_G, record_index) are NOT a confirmed "
+            "coordinate system - do not render these as acre/tile positions "
+            "without further reverse-engineering.",
+        ],
     }
 
 
 def get_island_map_data(island_name: str, force_refresh: bool = False) -> Dict[str, Any]:
-    """
-    Main entrypoint: retrieves parsed map data for an island (cached).
-    Checks both VILLAGERS_DIR and TWITCH_VILLAGERS_DIR.
-    Strictly parses real files. If maprefresh.nhl does not exist, returns
-    file_found: False and empty data. No mock data.
-    """
+    """Main entrypoint: retrieves parsed map data for an island (cached)."""
     import time
     clean_name = island_name.strip()
     norm_key = clean_name.lower()
@@ -409,8 +505,6 @@ def get_island_map_data(island_name: str, force_refresh: bool = False) -> Dict[s
                 "file_path": file_path,
                 "error": f"Failed to parse maprefresh.nhl: {exc}",
                 "items": [],
-                "sectors": {},
-                "sector_summary": {},
                 "stats": {"total_items": 0, "unique_categories": 0, "category_counts": {}},
             }
     else:
@@ -423,8 +517,6 @@ def get_island_map_data(island_name: str, force_refresh: bool = False) -> Dict[s
             "error": f"maprefresh.nhl not found for island '{clean_name}'.",
             "checked_paths": checked_paths,
             "items": [],
-            "sectors": {},
-            "sector_summary": {},
             "stats": {"total_items": 0, "unique_categories": 0, "category_counts": {}},
         }
 
@@ -463,9 +555,7 @@ def search_island_items(island_name: str, query: str) -> Dict[str, Any]:
     for item in map_data.get("items", []):
         name_match = q in item["name"].lower()
         cat_match = q in item["category"].lower()
-        sec_match = q == item["sector"].lower()
-
-        if name_match or cat_match or sec_match:
+        if name_match or cat_match:
             matches.append(item)
 
     return {
@@ -473,7 +563,7 @@ def search_island_items(island_name: str, query: str) -> Dict[str, Any]:
         "island": map_data["island"],
         "query": query,
         "file_found": True,
-        "status": map_data.get("status", "live_nhl"),
+        "status": map_data.get("status", "live_nhl_v2"),
         "total_matches": len(matches),
         "matches": matches,
     }
