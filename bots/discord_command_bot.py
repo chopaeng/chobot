@@ -276,6 +276,16 @@ def _is_mod_member(member: discord.abc.Snowflake) -> bool:
     return is_mod(member_roles)
 
 
+def _has_animal_crossing_role(member: discord.abc.Snowflake) -> bool:
+    """Return True when the member holds the Animal Crossing role.
+
+    Members without this role cannot see #chorder-bot, #chorder-rules, or
+    related order channels, so Chobot should guide them to #get-roles first.
+    """
+    ac_role_id = str(Config.ANIMAL_CROSSING_ROLE_ID)
+    return ac_role_id in _get_member_role_ids(member)
+
+
 def _get_accessible_islands(member: discord.abc.Snowflake) -> list[str]:
     """Return a list of sub island names that the member can access."""
     import json
@@ -1073,6 +1083,9 @@ class DiscordCommandCog(commands.Cog):
         self.island_down_states: dict[str, bool | None] = {}
         # island_clean -> discord.Message of the sticky "island is down" embed
         self.island_down_messages: dict[str, discord.Message] = {}
+        # island_clean -> list of members currently waiting for a !senddodo reply.
+        # Populated by send_dodo; cleared by island_monitor_loop on offline transition.
+        self.pending_dodo_waiters: dict[str, list[discord.Member]] = {}
         self.island_monitor_loop.start()
         self.free_dodo_board_loop.start()
         self.island_status_sticky_loop.start()
@@ -2872,6 +2885,7 @@ class DiscordCommandCog(commands.Cog):
             is_subscriber=_is_subscriber_member(ctx.author),
             is_mod_user=_is_mod_member(ctx.author),
             accessible_islands=_get_accessible_islands(ctx.author),
+            has_ac_role=_has_animal_crossing_role(ctx.author),
         )
 
         await ctx.reply(f"{answer}")
@@ -3266,6 +3280,10 @@ class DiscordCommandCog(commands.Cog):
                 and ISLAND_DODO_SENT_PATTERN.search(msg.content)
             )
 
+        # Register this member as waiting for a Dodo code so the island monitor
+        # can DM them immediately if the island goes offline during the wait.
+        island_clean_key = clean_text(ctx.channel.name)
+        self.pending_dodo_waiters.setdefault(island_clean_key, []).append(ctx.author)
         try:
             island_msg = await self.bot.wait_for('message', check=dodo_check, timeout=ISLAND_BOT_INTERCEPT_TIMEOUT)
             await island_msg.delete()
@@ -3274,6 +3292,11 @@ class DiscordCommandCog(commands.Cog):
             await self._log_dodo_request_to_xlog(ctx, reply_msg)
         except asyncio.TimeoutError:
             logger.warning(f"[DISCORD] Timeout waiting for island bot !sd response in {ctx.channel.name}")
+        finally:
+            # Always deregister — success, timeout, or unexpected error.
+            waiters = self.pending_dodo_waiters.get(island_clean_key, [])
+            if ctx.author in waiters:
+                waiters.remove(ctx.author)
 
     @commands.hybrid_command(name="visitors")
     async def visitors(self, ctx):
@@ -3994,6 +4017,22 @@ class DiscordCommandCog(commands.Cog):
                     logger.info(f"[DISCORD] Island monitor: {island} went OFFLINE")
                 except Exception as e:
                     logger.error(f"[DISCORD] Failed to send island-down embed for {island}: {e}")
+
+                # DM any members who are mid-!senddodo wait for this island so
+                # they aren't left hanging until their wait_for times out.
+                waiters = self.pending_dodo_waiters.pop(island_clean, [])
+                for member in waiters:
+                    try:
+                        await member.send(
+                            f"🏝️ **{island}** just went offline while you were waiting for a Dodo code.\n"
+                            f"Sorry about that! You can try another sub island in the meantime, "
+                            f"or check back once it comes back up."
+                        )
+                        logger.info(f"[DISCORD] Sent island-down DM to {member} for {island}")
+                    except discord.Forbidden:
+                        logger.debug(f"[DISCORD] Could not DM {member} (DMs disabled) for {island} down notice")
+                    except Exception as exc:
+                        logger.warning(f"[DISCORD] Failed to DM island-down notice to {member} for {island}: {exc}")
 
             elif is_online and was_down:
                 # Transition: offline → online
@@ -5591,6 +5630,7 @@ class DiscordCommandBot(commands.Bot):
                         is_subscriber=_is_subscriber_member(message.author),
                         is_mod_user=_is_mod_member(message.author),
                         accessible_islands=_get_accessible_islands(message.author),
+                        has_ac_role=_has_animal_crossing_role(message.author),
                     )
                 await message.reply(f"{answer}")
                 logger.info(f"[DISCORD] DM auto-reply by {message.author.name}: {question[:80]}")
@@ -5616,6 +5656,7 @@ class DiscordCommandBot(commands.Bot):
                     is_subscriber=_is_subscriber_member(message.author),
                     is_mod_user=_is_mod_member(message.author),
                     accessible_islands=_get_accessible_islands(message.author),
+                    has_ac_role=_has_animal_crossing_role(message.author),
                 )
             await message.reply(f"{answer}")
             logger.info(f"[DISCORD] Mention-ask by {message.author.name}: {question[:80]}")
@@ -5641,6 +5682,7 @@ class DiscordCommandBot(commands.Bot):
                         is_subscriber=_is_subscriber_member(message.author),
                         is_mod_user=_is_mod_member(message.author),
                         accessible_islands=_get_accessible_islands(message.author),
+                        has_ac_role=_has_animal_crossing_role(message.author),
                     )
                     await message.reply(f"{answer}")
                     logger.info(f"[DISCORD] Keyword auto-reply by {message.author.name}: {question[:80]}")
@@ -5681,6 +5723,7 @@ class DiscordCommandBot(commands.Bot):
                             is_subscriber=_is_subscriber_member(message.author),
                             is_mod_user=_is_mod_member(message.author),
                             accessible_islands=_get_accessible_islands(message.author),
+                            has_ac_role=_has_animal_crossing_role(message.author),
                         )
                     await message.reply(f"{answer}")
                     logger.info(f"[DISCORD] Reply-ask by {message.author.name}: {question[:80]}")

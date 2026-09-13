@@ -1072,8 +1072,8 @@ _FAQ_REGEX_ENTRIES: list[tuple[re.Pattern, str]] = [
     (
         _NO_ACCESS_CHORDER_PATTERN,
         "If you see 'no access' or cannot view `#chorder-bot`, follow these steps to get access:\n\n"
-        "1. READ THE #rules FIRST if you haven't read it yet.\n"
-        "2. Navigate to #get-roles channel and under **Games you play**, get the **Animal Crossing** role.\n"
+        "1. **Get the Animal Crossing role first** — go to <#762351782382141440> (`#get-roles`) and under **Games you play**, select **Animal Crossing** 🌿 *(this unlocks the order channels)*\n"
+        "2. READ THE #rules FIRST if you haven't yet.\n"
         "3. Go to #chorder-rules.\n"
         "4. Read and click **Done** to gain access to our #chorder-bot channel! 📦",
     ),
@@ -2198,6 +2198,7 @@ async def get_ai_answer(
     is_mod_user: bool = False,
     accessible_islands: Optional[list[str]] = None,
     role_data_computed_at: Optional[float] = None,
+    has_ac_role: bool = True,
 ) -> str:
     """
     Answer a question about Chopaeng.
@@ -2221,9 +2222,77 @@ async def get_ai_answer(
     role_age = f"{time.time() - role_data_computed_at:.1f}s" if role_data_computed_at else "unknown"
     logger.debug(
         "[ChopaengAI] access_context user_q=%r is_subscriber=%s accessible_islands=%s "
-        "role_data_age=%s conversation_key=%s channel_context=%s",
-        q, is_subscriber, accessible_islands, role_age, conversation_key, channel_context,
+        "has_ac_role=%s role_data_age=%s conversation_key=%s channel_context=%s",
+        q, is_subscriber, accessible_islands, has_ac_role, role_age, conversation_key, channel_context,
     )
+
+    # --- Animal Crossing role gate ---
+    # If the member lacks the Animal Crossing role they cannot see #chorder-bot,
+    # #chorder-rules, or any related order channels.  Intercept questions about
+    # ordering / the order bot early and give them the correct first step.
+    if not has_ac_role and not is_mod_user:
+        _AC_ROLE_KEYWORDS = (
+            "order", "chorder", "orderbot", "chorder-bot",
+            "how to order", "how do i order",
+        )
+        if any(kw in q.lower() for kw in _AC_ROLE_KEYWORDS):
+            _no_ac_role_answer = (
+                "Before you can use the order bot, you'll need the **Animal Crossing** role first! 🌿\n\n"
+                "Here's how to get it:\n"
+                "1. Go to <#762351782382141440> (`#get-roles`)\n"
+                "2. Under **Games you play**, select **Animal Crossing** 🦝\n\n"
+                "Once you have the role, you'll be able to see `#chorder-rules` and `#chorder-bot` "
+                "and follow the ordering steps from there!"
+            )
+            logger.debug(
+                "[ChopaengAI] branch=no_ac_role_gate question=%r", q,
+            )
+            if conversation_key:
+                conversation_store.add(conversation_key, q, _no_ac_role_answer)
+            return _no_ac_role_answer
+
+    # --- Sub island subscriber nudge ---
+    # Non-subscribers who ask about sub-island-specific features are nudged
+    # toward subscribing rather than receiving answers that assume access they
+    # don't yet have.  The gate is skipped when:
+    #   - The user is already a subscriber (is_subscriber=True)
+    #   - The user is a mod (is_mod_user=True)
+    #   - accessible_islands is non-empty (partial sub access via another tier)
+    # Live search results (item/villager on sub islands) are intentionally
+    # excluded — _format_live_search_answer already handles that path.
+    _SUB_ISLAND_NUDGE_KEYWORDS = (
+        "sub island", "sub islands", "sub-island",
+        "!senddodo", "!sd", "senddodo",
+        "!drop", "!find", "!injectvillager", "!mvi",
+        "how do i get sub", "how to get sub",
+        "how to access sub", "how do i access sub",
+        "get into sub", "visit sub island",
+        "subscriber island", "subscriber islands",
+    )
+    if (
+        not is_subscriber
+        and not is_mod_user
+        and not accessible_islands  # empty list [] or None both falsy
+        and any(kw in q.lower() for kw in _SUB_ISLAND_NUDGE_KEYWORDS)
+    ):
+        _no_sub_nudge_answer = (
+            "Sub islands are available to **subscribers** only. 🌟\n\n"
+            "To get access, subscribe on any of these platforms and link your account to Discord:\n"
+            "- [Patreon](https://www.patreon.com/cw/chopaeng/membership)\n"
+            "- [YouTube Membership](https://www.youtube.com/@chopaengtv)\n"
+            "- [Twitch Subscription](https://twitch.tv/chopaeng)\n"
+            "- [TikTok Community](https://www.tiktok.com/@chopaengtv)\n\n"
+            "Once subscribed, follow the verification steps in <#783677194576330792> "
+            "to unlock all 20 sub islands! 🏝️\n\n"
+            "In the meantime, **free members** can get items via the order bot (<#1175672083183829075>) "
+            "or visit our 27 free islands on the Dodo Board (<#1500493205672825056>)."
+        )
+        logger.debug(
+            "[ChopaengAI] branch=no_sub_nudge question=%r", q,
+        )
+        if conversation_key:
+            conversation_store.add(conversation_key, q, _no_sub_nudge_answer)
+        return _no_sub_nudge_answer
 
     # Respond to greetings warmly without hitting the KB or API.
     if _is_greeting(q):
