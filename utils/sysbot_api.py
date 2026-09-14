@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import urllib3.exceptions
 
 from utils.config import Config
 from utils.database import connect_db
@@ -127,13 +128,16 @@ class SysBotClient:
         api_key: Optional[str] = None,
         timeout: int = 10,
     ):
-        self.base_url = (base_url or getattr(Config, "SYSBOT_API_URL", "") or "http://localhost:5202").rstrip("/")
-        self.api_key = api_key or getattr(Config, "SYSBOT_API_KEY", "") or ""
+        raw_url = base_url if base_url is not None else getattr(Config, "SYSBOT_API_URL", "")
+        self.base_url = (raw_url or "").rstrip("/")
+        self.api_key = api_key if api_key is not None else getattr(Config, "SYSBOT_API_KEY", "") or ""
         self.timeout = timeout
         self._session: Optional[requests.Session] = None
         self._bundles_cache: Optional[List[Dict[str, Any]]] = None
         self._bundles_cache_time: float = 0
         self._bundles_cache_ttl: float = 300  # 5 minutes
+        self._offline_until: float = 0.0
+        self._offline_cooldown: float = 10.0
 
         _ensure_order_table()
 
@@ -141,7 +145,10 @@ class SysBotClient:
         if self._session is None:
             self._session = requests.Session()
             retry = Retry(
-                total=2,
+                total=1,
+                connect=False,  # Never retry when target actively refused connection / offline
+                read=1,
+                status=1,
                 backoff_factor=0.3,
                 status_forcelist=[502, 503, 504],
                 allowed_methods=["GET", "POST", "DELETE"],
@@ -161,62 +168,102 @@ class SysBotClient:
     # ── Synchronous HTTP Request Helpers ─────────────────────────────────────
 
     def _get(self, path: str, **params) -> Tuple[dict, int]:
+        if not self.base_url:
+            return {"success": False, "error": "SysBot API is not configured."}, 503
+
+        now = time.monotonic()
+        if path in ("/api/status", "/api/queue") and now < self._offline_until:
+            return {"success": False, "error": "SysBot API is unreachable or offline."}, 503
+
         url = f"{self.base_url}{path}"
+        timeout_val = (1.5, 3.0) if path in ("/api/status", "/api/queue") else (3.0, float(self.timeout))
         try:
             resp = self._get_session().get(
                 url,
                 headers=self._headers(),
                 params={k: v for k, v in params.items() if v is not None},
-                timeout=self.timeout,
+                timeout=timeout_val,
             )
+            if resp.status_code in (502, 503, 504):
+                self._offline_until = time.monotonic() + self._offline_cooldown
+            else:
+                self._offline_until = 0.0
             try:
                 return resp.json(), resp.status_code
             except Exception:
                 return {"success": False, "error": f"HTTP {resp.status_code}: non-JSON response"}, resp.status_code
-        except requests.exceptions.ConnectionError:
+        except (requests.exceptions.ConnectionError, urllib3.exceptions.HTTPError, OSError):
+            self._offline_until = time.monotonic() + self._offline_cooldown
             return {"success": False, "error": "SysBot API is unreachable or offline."}, 503
         except requests.exceptions.Timeout:
+            self._offline_until = time.monotonic() + self._offline_cooldown
             return {"success": False, "error": "SysBot API request timed out."}, 504
         except Exception as exc:
+            self._offline_until = time.monotonic() + self._offline_cooldown
             return {"success": False, "error": str(exc)}, 500
 
     def _post(self, path: str, payload: dict) -> Tuple[dict, int]:
+        if not self.base_url:
+            return {"success": False, "error": "SysBot API is not configured."}, 503
+
+        now = time.monotonic()
+        if now < self._offline_until and path != "/api/order/cancel":
+            return {"success": False, "error": "SysBot API is unreachable or offline."}, 503
+
         url = f"{self.base_url}{path}"
         try:
             resp = self._get_session().post(
                 url,
                 headers=self._headers(),
                 json=payload,
-                timeout=self.timeout,
+                timeout=(3.0, float(self.timeout)),
             )
+            if resp.status_code in (502, 503, 504):
+                self._offline_until = time.monotonic() + self._offline_cooldown
+            else:
+                self._offline_until = 0.0
             try:
                 return resp.json(), resp.status_code
             except Exception:
                 return {"success": False, "error": f"HTTP {resp.status_code}: non-JSON response"}, resp.status_code
-        except requests.exceptions.ConnectionError:
+        except (requests.exceptions.ConnectionError, urllib3.exceptions.HTTPError, OSError):
+            self._offline_until = time.monotonic() + self._offline_cooldown
             return {"success": False, "error": "SysBot API is unreachable or offline."}, 503
         except requests.exceptions.Timeout:
+            self._offline_until = time.monotonic() + self._offline_cooldown
             return {"success": False, "error": "SysBot API request timed out."}, 504
         except Exception as exc:
+            self._offline_until = time.monotonic() + self._offline_cooldown
             return {"success": False, "error": str(exc)}, 500
 
     # ── Async API Methods ───────────────────────────────────────────────────
 
     async def get_bot_status(self) -> dict:
         """Fetch SysBot island and order bot state."""
+        island_default = getattr(Config, "ORDER_BOT_ISLAND", "Sinta")
+        if not self.base_url or time.monotonic() < self._offline_until:
+            return {
+                "success": False,
+                "error": "SysBot API is not configured." if not self.base_url else "SysBot API is offline.",
+                "island_name": island_default,
+                "is_running": False,
+                "accepting_commands": False,
+                "queue_count": 0,
+            }
+
         data, code = await asyncio.to_thread(self._get, "/api/status")
         if not isinstance(data, dict):
             data = {"success": False, "error": "Invalid response"}
 
         if code == 200 or data.get("success"):
-            data.setdefault("island_name", getattr(Config, "ORDER_BOT_ISLAND", "Sinta"))
+            data.setdefault("island_name", island_default)
             data.setdefault("is_running", True)
             data.setdefault("accepting_commands", True)
             data.setdefault("queue_count", 0)
         else:
             data.setdefault("is_running", False)
             data.setdefault("accepting_commands", False)
-            data.setdefault("island_name", getattr(Config, "ORDER_BOT_ISLAND", "Sinta"))
+            data.setdefault("island_name", island_default)
             data.setdefault("queue_count", 0)
 
         return data

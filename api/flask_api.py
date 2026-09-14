@@ -2667,10 +2667,13 @@ def get_shared_pocket(pocket_id: str):
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import urllib3.exceptions
 
 # Module-level connection-pooled session with automatic retry on transient
 # Cloudflare / network errors (502, 503, 504).  Created lazily on first use.
 _sysbot_session: requests.Session | None = None
+_sysbot_offline_until: float = 0.0
+_SYSBOT_OFFLINE_COOLDOWN = 10.0  # seconds to wait before probing SysBot again after failure
 
 
 def _get_sysbot_session() -> requests.Session:
@@ -2679,8 +2682,11 @@ def _get_sysbot_session() -> requests.Session:
     if _sysbot_session is None:
         _sysbot_session = requests.Session()
         retry_strategy = Retry(
-            total=3,
-            backoff_factor=0.5,           # 0s → 0.5s → 1s between retries
+            total=1,
+            connect=False,                # DO NOT retry connection refused / unreachable — fail immediately!
+            read=1,
+            status=1,
+            backoff_factor=0.3,           # minimal backoff
             status_forcelist=[502, 503, 504],
             allowed_methods=["GET", "POST", "DELETE"],
             raise_on_status=False,        # let us read the response body even on errors
@@ -2726,37 +2732,57 @@ def _sysbot_parse_response(resp: requests.Response, method: str, path: str) -> t
 
 def _sysbot_get(path: str, **params) -> tuple:
     """Forward a GET to the SysBot API.  Returns (dict, http_status)."""
+    global _sysbot_offline_until
     base = getattr(Config, "SYSBOT_API_URL", "") or ""
     if not base:
         return {"success": False, "error": "SysBot API is not configured (set SYSBOT_API_URL in .env)."}, 503
+
+    now = time.monotonic()
+    if path in ("/api/status", "/api/queue") and now < _sysbot_offline_until:
+        return {"success": False, "error": "SysBot API is currently offline."}, 503
+
     url = f"{base}{path}"
     t0 = time.monotonic()
+    timeout = (1.5, 3.0) if path in ("/api/status", "/api/queue") else (3.0, 15.0)
     try:
         resp = _get_sysbot_session().get(
             url,
             headers=_sysbot_headers(),
             params={k: v for k, v in params.items() if v is not None},
-            timeout=(5, 15),
+            timeout=timeout,
         )
         elapsed = round((time.monotonic() - t0) * 1000)
         logger.debug("[SysBot] GET %s → %d (%dms)", path, resp.status_code, elapsed)
+        if 200 <= resp.status_code < 300:
+            _sysbot_offline_until = 0.0
+        elif resp.status_code in (502, 503, 504):
+            _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
         return _sysbot_parse_response(resp, "GET", path)
-    except requests.exceptions.ConnectionError:
-        logger.warning("[SysBot] GET %s — connection refused / unreachable", path)
+    except (requests.exceptions.RequestException, urllib3.exceptions.HTTPError, OSError):
+        _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
+        logger.debug("[SysBot] GET %s — connection refused / unreachable", path)
         return {"success": False, "error": "SysBot API is unreachable."}, 503
     except requests.exceptions.Timeout:
+        _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
         logger.warning("[SysBot] GET %s — timed out after %.1fs", path, time.monotonic() - t0)
         return {"success": False, "error": "SysBot API request timed out."}, 504
     except Exception as exc:
+        _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
         logger.warning("[SysBot] GET %s failed: %s", path, exc)
         return {"success": False, "error": str(exc)}, 500
 
 
 def _sysbot_post(path: str, body: dict | None = None) -> tuple:
     """Forward a POST to the SysBot API.  Returns (dict, http_status)."""
+    global _sysbot_offline_until
     base = getattr(Config, "SYSBOT_API_URL", "") or ""
     if not base:
         return {"success": False, "error": "SysBot API is not configured (set SYSBOT_API_URL in .env)."}, 503
+
+    now = time.monotonic()
+    if now < _sysbot_offline_until and path != "/api/order/cancel":
+        return {"success": False, "error": "SysBot API is currently offline."}, 503
+
     url = f"{base}{path}"
     t0 = time.monotonic()
     try:
@@ -2764,27 +2790,40 @@ def _sysbot_post(path: str, body: dict | None = None) -> tuple:
             url,
             headers=_sysbot_headers(),
             json=body or {},
-            timeout=(5, 15),
+            timeout=(3.0, 15.0),
         )
         elapsed = round((time.monotonic() - t0) * 1000)
         logger.debug("[SysBot] POST %s → %d (%dms)", path, resp.status_code, elapsed)
+        if 200 <= resp.status_code < 300:
+            _sysbot_offline_until = 0.0
+        elif resp.status_code in (502, 503, 504):
+            _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
         return _sysbot_parse_response(resp, "POST", path)
-    except requests.exceptions.ConnectionError:
-        logger.warning("[SysBot] POST %s — connection refused / unreachable", path)
+    except (requests.exceptions.RequestException, urllib3.exceptions.HTTPError, OSError):
+        _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
+        logger.debug("[SysBot] POST %s — connection refused / unreachable", path)
         return {"success": False, "error": "SysBot API is unreachable."}, 503
     except requests.exceptions.Timeout:
+        _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
         logger.warning("[SysBot] POST %s — timed out after %.1fs", path, time.monotonic() - t0)
         return {"success": False, "error": "SysBot API request timed out."}, 504
     except Exception as exc:
+        _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
         logger.warning("[SysBot] POST %s failed: %s", path, exc)
         return {"success": False, "error": str(exc)}, 500
 
 
 def _sysbot_delete(path: str, **params) -> tuple:
     """Forward a DELETE to the SysBot API.  Returns (dict, http_status)."""
+    global _sysbot_offline_until
     base = getattr(Config, "SYSBOT_API_URL", "") or ""
     if not base:
         return {"success": False, "error": "SysBot API is not configured (set SYSBOT_API_URL in .env)."}, 503
+
+    now = time.monotonic()
+    if now < _sysbot_offline_until:
+        return {"success": False, "error": "SysBot API is currently offline."}, 503
+
     url = f"{base}{path}"
     t0 = time.monotonic()
     try:
@@ -2792,16 +2831,24 @@ def _sysbot_delete(path: str, **params) -> tuple:
             url,
             headers=_sysbot_headers(),
             params={k: v for k, v in params.items() if v is not None},
-            timeout=(5, 15),
+            timeout=(3.0, 15.0),
         )
         elapsed = round((time.monotonic() - t0) * 1000)
         logger.debug("[SysBot] DELETE %s → %d (%dms)", path, resp.status_code, elapsed)
+        if 200 <= resp.status_code < 300:
+            _sysbot_offline_until = 0.0
+        elif resp.status_code in (502, 503, 504):
+            _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
         return _sysbot_parse_response(resp, "DELETE", path)
-    except requests.exceptions.ConnectionError:
+    except (requests.exceptions.RequestException, urllib3.exceptions.HTTPError, OSError):
+        _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
+        logger.debug("[SysBot] DELETE %s — connection refused / unreachable", path)
         return {"success": False, "error": "SysBot API is unreachable."}, 503
     except requests.exceptions.Timeout:
+        _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
         return {"success": False, "error": "SysBot API request timed out."}, 504
     except Exception as exc:
+        _sysbot_offline_until = time.monotonic() + _SYSBOT_OFFLINE_COOLDOWN
         logger.warning("[SysBot] DELETE %s failed: %s", path, exc)
         return {"success": False, "error": str(exc)}, 500
 
@@ -2906,16 +2953,25 @@ def get_order_bot_status():
 
     # Forward all fields as-is from Sinta — the frontend will pick what it needs.
     # Only enrich with defaults for critical fields the frontend relies on.
-    if isinstance(data, dict) and data.get("success"):
-        data.setdefault("island_name", getattr(Config, "ORDER_BOT_ISLAND", "Sinta"))
-        data.setdefault("accepting_commands", True)
-        data.setdefault("queue_count", 0)
-        # Ensure visitor_list is always an array
-        if "visitors" in data and "visitor_list" not in data:
-            visitors_str = data.get("visitors") or ""
-            data["visitor_list"] = [v.strip() for v in visitors_str.split("\n") if v.strip()] if visitors_str else []
-        data.setdefault("visitor_list", [])
-        data.setdefault("visitors_count", len(data["visitor_list"]))
+    if isinstance(data, dict):
+        if data.get("success"):
+            data.setdefault("island_name", getattr(Config, "ORDER_BOT_ISLAND", "Sinta"))
+            data.setdefault("accepting_commands", True)
+            data.setdefault("queue_count", 0)
+            # Ensure visitor_list is always an array
+            if "visitors" in data and "visitor_list" not in data:
+                visitors_str = data.get("visitors") or ""
+                data["visitor_list"] = [v.strip() for v in visitors_str.split("\n") if v.strip()] if visitors_str else []
+            data.setdefault("visitor_list", [])
+            data.setdefault("visitors_count", len(data["visitor_list"]))
+        else:
+            # Safe defaults when offline so frontend widgets don't crash or show undefined
+            data.setdefault("is_running", False)
+            data.setdefault("accepting_commands", False)
+            data.setdefault("island_name", getattr(Config, "ORDER_BOT_ISLAND", "Sinta"))
+            data.setdefault("queue_count", 0)
+            data.setdefault("visitor_list", [])
+            data.setdefault("visitors_count", 0)
 
     return jsonify(data), code
 

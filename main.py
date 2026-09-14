@@ -101,6 +101,8 @@ for _mod_name in [
 if os.getenv("VERBOSE_LIBS", "false").lower() not in ("true", "1", "yes"):
     for _lib in ("discord.gateway", "discord.http", "websockets", "httpcore", "httpx", "asyncio"):
         logging.getLogger(_lib).setLevel(logging.INFO)
+    for _lib in ("urllib3", "urllib3.connectionpool"):
+        logging.getLogger(_lib).setLevel(logging.ERROR)
 
 logger = logging.getLogger("Main")
 
