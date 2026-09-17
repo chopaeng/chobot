@@ -809,6 +809,98 @@ def _fire_dodo_webhook(
         logger.warning("Dodo webhook failed: %s", exc)
 
 
+_SUGGESTIONS_WEBHOOK_DEBOUNCE = {}
+_SUGGESTIONS_WEBHOOK_DEBOUNCE_TTL = 15  # 15 seconds cooldown
+
+
+def _fire_suggestions_webhook(
+    title: str,
+    description: str,
+    discord_username: str = "",
+    in_game_name: str = "",
+    island_name: str = "",
+    page_url: str = "",
+    user_id: str = "",
+    avatar_url: str = "",
+) -> None:
+    """POST a formatted suggestion embed to the configured Discord suggestions webhook."""
+    url = getattr(Config, "SUGGESTIONS_WEBHOOK_URL", "") or os.getenv("SUGGESTIONS_WEBHOOK_URL", "")
+    if not url:
+        logger.warning("SUGGESTIONS_WEBHOOK_URL is not configured")
+        return
+
+    sender_identity = f"`{discord_username.strip()}`" if discord_username.strip() else ("Anonymous Resident" if not user_id else f"<@{user_id}>")
+    in_game_parts = []
+    if in_game_name.strip():
+        in_game_parts.append(f"IGN: **{in_game_name.strip()}**")
+    if island_name.strip():
+        in_game_parts.append(f"Island: **{island_name.strip()}**")
+    in_game_info = " • ".join(in_game_parts)
+
+    fields = [
+        {
+            "name": "👤 Submitted By",
+            "value": f"{sender_identity}\n{in_game_info}" if in_game_info else sender_identity,
+            "inline": True,
+        },
+        {
+            "name": "📝 Details / Feedback",
+            "value": description.strip()[:1024],
+            "inline": False,
+        },
+    ]
+
+    if page_url.strip():
+        clean_page_url = page_url.strip()
+        fields.append({
+            "name": "🌐 Submitted From",
+            "value": f"[{clean_page_url}]({clean_page_url})",
+            "inline": False,
+        })
+
+    embed = {
+        "title": f"💡 Suggestion: {title.strip()[:250]}",
+        "description": "A new resident suggestion has been submitted from **Chopaeng**!",
+        "color": 0x198754,
+        "fields": fields,
+        "footer": {
+            "text": "Chopaeng Resident Feedback System • Live Dispatcher",
+            "icon_url": "https://www.chopaeng.com/logo.png",
+        },
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    if avatar_url:
+        embed["thumbnail"] = {"url": avatar_url}
+
+    payload = json.dumps({
+        "username": "Chopaeng Suggestion Box",
+        "avatar_url": "https://www.chopaeng.com/logo.png",
+        "embeds": [embed],
+    }).encode("utf-8")
+
+    try:
+        resp = discord_request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": _DISCORD_UA},
+            method="POST",
+            timeout=10,
+        )
+        if resp.status not in (200, 204):
+            logger.warning("Suggestions webhook unexpected HTTP status: %s", resp.status)
+        else:
+            logger.info("Suggestions webhook delivered: %r by %s", title[:40], discord_username or user_id or "anonymous")
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode(errors="replace")
+        except Exception:
+            pass
+        logger.warning("Suggestions webhook failed HTTP %s: %s", exc.code, body)
+    except Exception as exc:
+        logger.warning("Suggestions webhook failed: %s", exc)
+
+
 def set_data_manager(dm):
     """Set the data manager instance"""
     global data_manager
@@ -1321,6 +1413,61 @@ def auth_logout():
         token = auth[len("Bearer "):]
         revoke_auth_token(token)
     return jsonify({"logged_out": True})
+
+
+@app.route("/api/suggestions", methods=["POST"])
+def api_suggestions():
+    """Submit a resident suggestion/feedback via secure server-side Discord webhook."""
+    data = request.get_json(silent=True) or {}
+    title = clean_text(data.get("title") or "")
+    description = clean_text(data.get("description") or "")
+    if not title or not description:
+        return jsonify({"success": False, "error": "Both title and description are required."}), 400
+
+    if len(title) > 250:
+        title = title[:250]
+    if len(description) > 2000:
+        description = description[:2000]
+
+    # Optional authenticated user
+    auth_user = _current_auth_user()
+    user_id = str(auth_user.get("user_id") or "") if auth_user else ""
+    avatar_url = auth_user.get("avatar") or "" if auth_user else ""
+
+    discord_username = clean_text(
+        data.get("discordUsername") or data.get("discord_username") or (auth_user.get("username") if auth_user else "") or ""
+    )
+    in_game_name = clean_text(data.get("inGameName") or data.get("in_game_name") or "")
+    island_name = clean_text(data.get("islandName") or data.get("island_name") or "")
+    page_url = str(data.get("pageUrl") or data.get("page_url") or "").strip()
+
+    # Rate limiting: 15 seconds cooldown per IP / user
+    ip = _client_ip()
+    cache_key = f"sugg:{user_id or ip}"
+    now = time.monotonic()
+    last_fired = _SUGGESTIONS_WEBHOOK_DEBOUNCE.get(cache_key)
+    if last_fired and (now - last_fired) < _SUGGESTIONS_WEBHOOK_DEBOUNCE_TTL:
+        remaining = int(_SUGGESTIONS_WEBHOOK_DEBOUNCE_TTL - (now - last_fired)) + 1
+        return jsonify({
+            "success": False,
+            "error": f"Please wait {remaining}s before submitting another suggestion.",
+            "cooldownSeconds": remaining,
+        }), 429
+    _SUGGESTIONS_WEBHOOK_DEBOUNCE[cache_key] = now
+
+    threading.Thread(
+        target=_fire_suggestions_webhook,
+        args=(title, description, discord_username, in_game_name, island_name, page_url, user_id, avatar_url),
+        daemon=True,
+    ).start()
+
+    _record_api_audit_event(
+        "suggestion_submitted",
+        user_id or "anonymous",
+        {"title": title[:50], "ip": ip},
+    )
+
+    return jsonify({"success": True, "message": "Suggestion submitted successfully."}), 200
 
 
 # ============================================================================

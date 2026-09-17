@@ -31,6 +31,7 @@ import logging
 import traceback
 import signal
 import contextlib
+import discord
 from typing import Optional, Set
 
 # Add project root to path
@@ -308,36 +309,50 @@ async def _run_twitch_lifecycle(twitch_bot: TwitchBot) -> None:
 
 
 def run_twitch(data_manager: DataManager, find_only: bool = False):
-    """Run Twitch bot in a thread with its own event loop."""
-    loop: Optional[asyncio.AbstractEventLoop] = None
-    twitch_bot: Optional[TwitchBot] = None
-    try:
-        mode = "find-only" if find_only else "full"
-        logger.info(f"[TWITCH] Starting Twitch bot ({mode} mode)...")
-        record_service_status("twitch", mode=mode, status="starting")
+    """Run Twitch bot in a thread with its own event loop and auto-reconnect."""
+    mode = "find-only" if find_only else "full"
+    reconnect_delay = 5
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        twitch_bot = TwitchBot(data_manager)
-        record_service_status("twitch", mode=mode, status="running")
-        loop.run_until_complete(_run_twitch_lifecycle(twitch_bot))
-
-    except Exception as e:
-        logger.error(f"[TWITCH] Critical error: {e}")
-        logger.error(traceback.format_exc())
-        record_service_status("twitch", mode="find-only" if find_only else "full", status="error", error=str(e))
-        STOP_EVENT.set()
-    finally:
+    while not STOP_EVENT.is_set():
+        loop: Optional[asyncio.AbstractEventLoop] = None
+        twitch_bot: Optional[TwitchBot] = None
         try:
-            if loop and not loop.is_closed():
-                if twitch_bot is not None:
-                    loop.run_until_complete(_safe_close_twitch_bot(twitch_bot))
-                loop.stop()
-                loop.close()
-        except Exception:
-            pass
-        record_service_status("twitch", mode="find-only" if find_only else "full", status="stopped")
+            logger.info(f"[TWITCH] Starting Twitch bot ({mode} mode)...")
+            record_service_status("twitch", mode=mode, status="starting")
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            twitch_bot = TwitchBot(data_manager)
+            record_service_status("twitch", mode=mode, status="running")
+            loop.run_until_complete(_run_twitch_lifecycle(twitch_bot))
+
+            if STOP_EVENT.is_set():
+                break
+
+            logger.warning("[TWITCH] Twitch bot stopped. Reconnecting in 5s...")
+            reconnect_delay = 5
+
+        except Exception as e:
+            if STOP_EVENT.is_set():
+                break
+            logger.error(f"[TWITCH] Error in Twitch bot: {e}")
+            logger.error(traceback.format_exc())
+            record_service_status("twitch", mode=mode, status="error", error=str(e))
+            logger.info(f"[TWITCH] Reconnecting in {reconnect_delay}s...")
+            time.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 60)
+        finally:
+            try:
+                if loop and not loop.is_closed():
+                    if twitch_bot is not None:
+                        loop.run_until_complete(_safe_close_twitch_bot(twitch_bot))
+                    loop.stop()
+                    loop.close()
+            except Exception:
+                pass
+
+    record_service_status("twitch", mode=mode, status="stopped")
 
 
 # ============================================================================
@@ -348,66 +363,101 @@ async def run_discord(
         flight_logger_only: bool = False,
         find_only: bool = False,
 ) -> bool:
-    """Run Discord bot on the main asyncio loop.
+    """Run Discord bot on the main asyncio loop with auto-reconnect supervision.
 
     Returns True if the caller should restart the process (OTA update),
     False otherwise.
     """
-    discord_bot: Optional[DiscordCommandBot] = None
-    try:
-        if flight_logger_only:
-            mode = "FlightLogger-only"
-        elif find_only:
-            mode = "find-only"
-        else:
-            mode = "full"
-        logger.info(f"[DISCORD] Starting Discord bot ({mode} mode)...")
-        record_service_status("discord", mode=mode, status="starting")
+    if flight_logger_only:
+        mode = "FlightLogger-only"
+    elif find_only:
+        mode = "find-only"
+    else:
+        mode = "full"
 
-        discord_bot = DiscordCommandBot(data_manager, load_command_cog=not flight_logger_only)
+    restart_requested = False
+    reconnect_delay = 5
+    max_reconnect_delay = 60
 
-        if flight_logger_only:
-            await discord_bot.add_cog(FlightLoggerCog(discord_bot))
-            await discord_bot.add_cog(FreeFlightCog(discord_bot))
-            logger.info("[DISCORD] Loaded cog: FlightLoggerCog + FreeFlightCog (only)")
-        elif find_only:
-            # Load only find/search-related cogs here
-            # await discord_bot.add_cog(FindCog(discord_bot))
-            logger.info("[DISCORD] Loaded find/search cogs only")
-        else:
-            # Full bot — load all cogs
-            await discord_bot.add_cog(FlightLoggerCog(discord_bot))
-            await discord_bot.add_cog(FreeFlightCog(discord_bot))
-            # await discord_bot.add_cog(FindCog(discord_bot))
-            # await discord_bot.add_cog(SomeOtherCog(discord_bot))
-            logger.info("[DISCORD] Loaded all cogs ✓")
+    while not STOP_EVENT.is_set():
+        discord_bot: Optional[DiscordCommandBot] = None
+        watcher_task: Optional[asyncio.Task] = None
+        try:
+            logger.info(f"[DISCORD] Starting Discord bot ({mode} mode)...")
+            record_service_status("discord", mode=mode, status="starting")
 
-        async def stop_watcher():
-            while not STOP_EVENT.is_set():
-                await asyncio.sleep(0.5)
-            logger.warning("[DISCORD] Stop signal received, closing bot...")
-            await discord_bot.close()
+            discord_bot = DiscordCommandBot(data_manager, load_command_cog=not flight_logger_only)
 
-        watcher_task = asyncio.create_task(stop_watcher())
+            if flight_logger_only:
+                await discord_bot.add_cog(FlightLoggerCog(discord_bot))
+                await discord_bot.add_cog(FreeFlightCog(discord_bot))
+                logger.info("[DISCORD] Loaded cog: FlightLoggerCog + FreeFlightCog (only)")
+            elif find_only:
+                # Load only find/search-related cogs here
+                # await discord_bot.add_cog(FindCog(discord_bot))
+                logger.info("[DISCORD] Loaded find/search cogs only")
+            else:
+                # Full bot — load all cogs
+                await discord_bot.add_cog(FlightLoggerCog(discord_bot))
+                await discord_bot.add_cog(FreeFlightCog(discord_bot))
+                # await discord_bot.add_cog(FindCog(discord_bot))
+                # await discord_bot.add_cog(SomeOtherCog(discord_bot))
+                logger.info("[DISCORD] Loaded all cogs ✓")
 
-        record_service_status("discord", mode=mode, status="running")
-        await discord_bot.start(Config.DISCORD_TOKEN)
+            async def stop_watcher():
+                while not STOP_EVENT.is_set():
+                    await asyncio.sleep(0.5)
+                logger.warning("[DISCORD] Stop signal received, closing bot...")
+                if discord_bot and not discord_bot.is_closed():
+                    await discord_bot.close()
 
-        watcher_task.cancel()
-        record_service_status("discord", mode=mode, status="stopped")
+            watcher_task = asyncio.create_task(stop_watcher())
 
-    except Exception as e:
-        logger.error(f"[DISCORD] Critical error: {e}")
-        logger.error(traceback.format_exc())
-        record_service_status("discord", mode=mode if "mode" in locals() else "unknown", status="error", error=str(e))
-        STOP_EVENT.set()
-        if discord_bot:
-            try:
-                await discord_bot.close()
-            except Exception:
-                pass
+            record_service_status("discord", mode=mode, status="running")
+            await discord_bot.start(Config.DISCORD_TOKEN)
 
-    return bool(discord_bot and discord_bot.restart_requested)
+            # Check if an OTA update restart was requested
+            if discord_bot and discord_bot.restart_requested:
+                restart_requested = True
+                break
+
+            if STOP_EVENT.is_set():
+                break
+
+            logger.warning("[DISCORD] Discord bot disconnected unexpectedly. Reconnecting in 5s...")
+            reconnect_delay = 5
+
+        except (discord.ConnectionClosed, discord.GatewayNotFound, discord.HTTPException, asyncio.TimeoutError, OSError) as net_err:
+            if STOP_EVENT.is_set():
+                break
+            logger.warning(f"[DISCORD] Network/Gateway error ({type(net_err).__name__}: {net_err}). Reconnecting in {reconnect_delay}s...")
+            record_service_status("discord", mode=mode, status="reconnecting", error=str(net_err))
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+        except Exception as e:
+            if STOP_EVENT.is_set():
+                break
+            logger.error(f"[DISCORD] Unexpected error in Discord bot: {e}")
+            logger.error(traceback.format_exc())
+            record_service_status("discord", mode=mode, status="error", error=str(e))
+            logger.info(f"[DISCORD] Auto-restarting Discord bot in {reconnect_delay}s...")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+        finally:
+            if watcher_task and not watcher_task.done():
+                watcher_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watcher_task
+            if discord_bot and not discord_bot.is_closed():
+                try:
+                    await discord_bot.close()
+                except Exception:
+                    pass
+
+    record_service_status("discord", mode=mode, status="stopped")
+    return restart_requested
 
 
 # ============================================================================

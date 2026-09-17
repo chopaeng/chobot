@@ -99,6 +99,7 @@ class Config:
 
     # Discord webhook for logging dodo code reveals on the website
     DODO_LOG_WEBHOOK_URL = os.getenv("DODO_LOG_WEBHOOK_URL", "")
+    SUGGESTIONS_WEBHOOK_URL = os.getenv("SUGGESTIONS_WEBHOOK_URL", "")
 
     _FLASK_SECRET_ENV = os.getenv("FLASK_SECRET_KEY", "").strip()
     FLASK_SECRET_KEY: str = _FLASK_SECRET_ENV or DASHBOARD_SECRET or secrets.token_hex(32)

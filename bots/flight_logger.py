@@ -701,19 +701,18 @@ class AdmitConfirmView(discord.ui.View):
             if not visit_id and ign:
                 visit_id = await cog._get_recent_visit_id_by_ign(ign)
             if visit_id is not None:
-                db = await cog._get_db()
-                # Mark the visit as authorized now that a mod has manually admitted the traveler
-                await db.execute(
-                    "UPDATE island_visits SET authorized = 1 WHERE id = ?",
-                    (visit_id,),
-                )
-                # Link the selected Discord member to the visit record if provided
-                if self.selected_member:
+                async with connect_async_db() as db:
+                    # Mark the visit as authorized now that a mod has manually admitted the traveler
                     await db.execute(
-                        "UPDATE island_visits SET user_id = ? WHERE id = ? AND user_id IS NULL",
-                        (self.selected_member.id, visit_id),
+                        "UPDATE island_visits SET authorized = 1 WHERE id = ?",
+                        (visit_id,),
                     )
-                await db.commit()
+                    # Link the selected Discord member to the visit record if provided
+                    if self.selected_member:
+                        await db.execute(
+                            "UPDATE island_visits SET user_id = ? WHERE id = ? AND user_id IS NULL",
+                            (self.selected_member.id, visit_id),
+                        )
             target_id = self.selected_member.id if self.selected_member else None
             await cog.add_warning(target_id, interaction.guild.id, None, interaction.user.id, visit_id, action_type='ADMIT')
         # Update the confirmation message to show success
@@ -1404,20 +1403,39 @@ JOIN_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+MAX_ALERT_MERGE_SECONDS = 1800  # 30 minutes: re-joins within this window update the existing alert
+
 class FlightLoggerCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.island_map = {}
         self.all_sub_roles = set()
         self.join_pattern = JOIN_PATTERN
-        self._db_conn = None
         self.last_processed = None
-        self._pending_alerts: dict[tuple[str, str], int] = {}
+        # Maps (ign_clean, dest_clean) -> (message_id, alert_timestamp)
+        self._pending_alerts: dict[tuple[str, str], tuple[int, int]] = {}
         self._creating_alerts: set[tuple[str, str]] = set()
         self._pending_dodo_requests: dict[int, dict] = {}
-        self.fetch_islands_task.start()
-        self.cleanup_warnings_task.start()
-        self.check_r1_reminders_task.start()
+
+    def _prune_stale_caches(self):
+        """Prune in-memory alert and dodo request caches to prevent unbounded growth over days."""
+        now = int(discord.utils.utcnow().timestamp())
+        stale_alert_keys = [
+            k for k, v in self._pending_alerts.items()
+            if (now - (v[1] if isinstance(v, tuple) else now)) > MAX_ALERT_MERGE_SECONDS * 2
+        ]
+        for k in stale_alert_keys:
+            self._pending_alerts.pop(k, None)
+
+        stale_dodo_users = [
+            uid for uid, req in self._pending_dodo_requests.items()
+            if hasattr(req.get('timestamp'), 'timestamp') and (now - int(req['timestamp'].timestamp())) > 3600
+        ]
+        for uid in stale_dodo_users:
+            self._pending_dodo_requests.pop(uid, None)
+
+        if stale_alert_keys or stale_dodo_users:
+            logger.debug(f"[FLIGHT] Pruned {len(stale_alert_keys)} stale alerts, {len(stale_dodo_users)} stale dodo requests.")
 
     async def _load_sub_roles_from_db(self) -> set[int]:
         """Fallback: derive subscription role IDs from islands.required_roles in SQLite."""
@@ -1458,17 +1476,17 @@ class FlightLoggerCog(commands.Cog):
             return None
         cutoff = int(discord.utils.utcnow().timestamp()) - max_age_seconds
         try:
-            db = await self._get_db()
-            cur = await db.execute(
-                """
-                SELECT message_url, username, nickname FROM dodo_reveal_messages
-                WHERE island_clean = ? AND created_at >= ?
-                ORDER BY created_at DESC
-                LIMIT 40
-                """,
-                (dest_clean, cutoff),
-            )
-            rows = await cur.fetchall()
+            async with connect_async_db() as db:
+                cur = await db.execute(
+                    """
+                    SELECT message_url, username, nickname FROM dodo_reveal_messages
+                    WHERE island_clean = ? AND created_at >= ?
+                    ORDER BY created_at DESC
+                    LIMIT 40
+                    """,
+                    (dest_clean, cutoff),
+                )
+                rows = await cur.fetchall()
         except Exception as exc:
             logger.warning(f"[FLIGHT] dodo_reveal_messages lookup failed: {exc}")
             return None
@@ -1477,10 +1495,9 @@ class FlightLoggerCog(commands.Cog):
                 return message_url
         return None
 
-    async def _get_db(self):
-        if self._db_conn is None:
-            self._db_conn = connect_async_db()
-        return self._db_conn
+    def _get_db(self):
+        """Return an async database connection context manager."""
+        return connect_async_db()
 
     async def _resolve_member(self, guild: discord.Guild | None, user_id: int) -> discord.Member | None:
         """Resolve a member by ID using cache first, then fetch if missing."""
@@ -1498,81 +1515,77 @@ class FlightLoggerCog(commands.Cog):
             return None
 
     async def add_warning(self, user_id, guild_id, reason, mod_id, visit_id=None, action_type='WARN'):
-        db = await self._get_db()
-        await db.execute(
-            "INSERT INTO warnings (user_id, guild_id, reason, mod_id, timestamp, visit_id, action_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, guild_id, reason, mod_id, int(discord.utils.utcnow().timestamp()), visit_id, action_type)
-        )
-        await db.commit()
+        async with connect_async_db() as db:
+            await db.execute(
+                "INSERT INTO warnings (user_id, guild_id, reason, mod_id, timestamp, visit_id, action_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, guild_id, reason, mod_id, int(discord.utils.utcnow().timestamp()), visit_id, action_type)
+            )
 
     async def get_warn_count(self, user_id: int, guild_id: int, days: int = WARN_EXPIRY_DAYS):
-        db = await self._get_db()
         cutoff = int((discord.utils.utcnow() - datetime.timedelta(days=days)).timestamp())
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM warnings WHERE user_id = ? AND guild_id = ? AND timestamp > ? AND action_type = 'WARN'",
-            (user_id, guild_id, cutoff)
-        )
-        row = await cursor.fetchone()
-        return row[0] if row else 0
+        async with connect_async_db() as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM warnings WHERE user_id = ? AND guild_id = ? AND timestamp > ? AND action_type = 'WARN'",
+                (user_id, guild_id, cutoff)
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else 0
 
     async def remove_latest_warning(self, user_id: int, guild_id: int):
         """Remove the most recent warning for a user and return its details."""
-        db = await self._get_db()
-        cursor = await db.execute(
-            "SELECT rowid, reason, mod_id, timestamp FROM warnings WHERE user_id = ? AND guild_id = ? ORDER BY timestamp DESC LIMIT 1",
-            (user_id, guild_id)
-        )
-        row = await cursor.fetchone()
-        if row:
-            rowid, reason, mod_id, timestamp = row
-            await db.execute("DELETE FROM warnings WHERE rowid = ?", (rowid,))
-            await db.commit()
-            return {"reason": reason, "mod_id": mod_id, "timestamp": timestamp}
+        async with connect_async_db() as db:
+            cursor = await db.execute(
+                "SELECT rowid, reason, mod_id, timestamp FROM warnings WHERE user_id = ? AND guild_id = ? ORDER BY timestamp DESC LIMIT 1",
+                (user_id, guild_id)
+            )
+            row = await cursor.fetchone()
+            if row:
+                rowid, reason, mod_id, timestamp = row
+                await db.execute("DELETE FROM warnings WHERE rowid = ?", (rowid,))
+                return {"reason": reason, "mod_id": mod_id, "timestamp": timestamp}
         return None
 
     async def remove_all_warnings(self, user_id: int, guild_id: int):
         """Remove all warnings for a user and return the count removed."""
-        db = await self._get_db()
-        cursor = await db.execute(
-            "DELETE FROM warnings WHERE user_id = ? AND guild_id = ?",
-            (user_id, guild_id)
-        )
-        count = cursor.rowcount
-        await db.commit()
-        return count
+        async with connect_async_db() as db:
+            cursor = await db.execute(
+                "DELETE FROM warnings WHERE user_id = ? AND guild_id = ?",
+                (user_id, guild_id)
+            )
+            return cursor.rowcount
 
     async def get_warnings(self, user_id: int, guild_id: int, days: int = 30):
         """Get all warnings for a user within the specified number of days, including any linked island visit."""
-        db = await self._get_db()
         cutoff = int((discord.utils.utcnow() - datetime.timedelta(days=days)).timestamp())
-        cursor = await db.execute(
-            """SELECT w.reason, w.mod_id, w.timestamp, w.visit_id,
-                      iv.ign, iv.origin_island, iv.destination, iv.timestamp
-               FROM warnings w
-               LEFT JOIN island_visits iv ON w.visit_id = iv.id
-               WHERE w.user_id = ? AND w.guild_id = ? AND w.timestamp > ? AND w.action_type = 'WARN'
-               ORDER BY w.timestamp DESC""",
-            (user_id, guild_id, cutoff)
-        )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "reason": r[0], "mod_id": r[1], "timestamp": r[2], "visit_id": r[3],
-                "visit_ign": r[4], "visit_origin": r[5], "visit_destination": r[6], "visit_ts": r[7],
-            }
-            for r in rows
-        ]
+        async with connect_async_db() as db:
+            cursor = await db.execute(
+                """SELECT w.reason, w.mod_id, w.timestamp, w.visit_id,
+                          iv.ign, iv.origin_island, iv.destination, iv.timestamp
+                   FROM warnings w
+                   LEFT JOIN island_visits iv ON w.visit_id = iv.id
+                   WHERE w.user_id = ? AND w.guild_id = ? AND w.timestamp > ? AND w.action_type = 'WARN'
+                   ORDER BY w.timestamp DESC""",
+                (user_id, guild_id, cutoff)
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "reason": r[0], "mod_id": r[1], "timestamp": r[2], "visit_id": r[3],
+                    "visit_ign": r[4], "visit_origin": r[5], "visit_destination": r[6], "visit_ts": r[7],
+                }
+                for r in rows
+            ]
 
     async def _get_recent_visit_id_by_ign(self, ign: str, hours: int = 24) -> int | None:
         """Find the most recent island_visits.id for the given IGN within the last N hours."""
-        db = await self._get_db()
         cutoff = int((discord.utils.utcnow() - datetime.timedelta(hours=hours)).timestamp())
-        cursor = await db.execute(
-            "SELECT id FROM island_visits WHERE ign = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT 1",
-            (ign, cutoff)
-        )
-        row = await cursor.fetchone()
-        return row[0] if row else None
+        async with connect_async_db() as db:
+            cursor = await db.execute(
+                "SELECT id FROM island_visits WHERE ign = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT 1",
+                (ign, cutoff)
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
     def register_dodo_request(self, user_id: int, member: discord.Member, channel: discord.abc.GuildChannel, reply_msg: discord.Message | None, guild_icon: str | None) -> None:
         """Register a pending dodo-code request so it can be merged with the verified-flight xlog entry."""
@@ -1604,40 +1617,40 @@ class FlightLoggerCog(commands.Cog):
 
     async def get_recent_visit_id_by_user(self, user_id: int, guild_id: int, hours: int = 6) -> int | None:
         """Find the most recent island_visits.id for the given Discord user within the last N hours."""
-        db = await self._get_db()
         cutoff = int((discord.utils.utcnow() - datetime.timedelta(hours=hours)).timestamp())
-        cursor = await db.execute(
-            "SELECT id FROM island_visits WHERE user_id = ? AND guild_id = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT 1",
-            (user_id, guild_id, cutoff)
-        )
-        row = await cursor.fetchone()
-        return row[0] if row else None
+        async with connect_async_db() as db:
+            cursor = await db.execute(
+                "SELECT id FROM island_visits WHERE user_id = ? AND guild_id = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT 1",
+                (user_id, guild_id, cutoff)
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
     async def _get_recent_authorized_target(self, ign: str, hours: int = 24, guild_id: int | None = None) -> dict | None:
         """Return the recent authorized visit for this IGN when it has a linked target user."""
-        db = await self._get_db()
         cutoff = int((discord.utils.utcnow() - datetime.timedelta(hours=hours)).timestamp())
         guild_clause = "AND guild_id = ?" if guild_id is not None else ""
         params = [ign, cutoff]
         if guild_id is not None:
             params.append(guild_id)
-        cursor = await db.execute(
-            f"""SELECT id, user_id, guild_id, destination, timestamp
-               FROM island_visits
-               WHERE ign = ? AND timestamp > ? AND authorized = 1 AND user_id IS NOT NULL {guild_clause}
-               ORDER BY timestamp DESC LIMIT 1""",
-            params,
-        )
-        row = await cursor.fetchone()
-        if not row:
-            return None
-        return {
-            "id": row[0],
-            "user_id": row[1],
-            "guild_id": row[2],
-            "destination": row[3],
-            "timestamp": row[4],
-        }
+        async with connect_async_db() as db:
+            cursor = await db.execute(
+                f"""SELECT id, user_id, guild_id, destination, timestamp
+                   FROM island_visits
+                   WHERE ign = ? AND timestamp > ? AND authorized = 1 AND user_id IS NOT NULL {guild_clause}
+                   ORDER BY timestamp DESC LIMIT 1""",
+                params,
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0],
+                "user_id": row[1],
+                "guild_id": row[2],
+                "destination": row[3],
+                "timestamp": row[4],
+            }
 
     async def _is_authorized_with_target(self, ign: str, hours: int = 24, guild_id: int | None = None) -> bool:
         """Return True if this IGN has a recent visit that was authorized AND has a linked target user.
@@ -1678,16 +1691,15 @@ class FlightLoggerCog(commands.Cog):
 
         guild_id = member.guild.id if getattr(member, "guild", None) else None
         ts = created_at or int(discord.utils.utcnow().timestamp())
-        db = await self._get_db()
-        await db.execute(
-            """
-            INSERT INTO member_identity_events
-                (user_id, guild_id, event_type, old_display_name, new_display_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (member.id, guild_id, event_type, old_display_name, new_display_name, ts),
-        )
-        await db.commit()
+        async with connect_async_db() as db:
+            await db.execute(
+                """
+                INSERT INTO member_identity_events
+                    (user_id, guild_id, event_type, old_display_name, new_display_name, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (member.id, guild_id, event_type, old_display_name, new_display_name, ts),
+            )
 
     async def get_recent_identity_events(
         self,
@@ -1696,102 +1708,99 @@ class FlightLoggerCog(commands.Cog):
         window_seconds: int = RECENT_IDENTITY_WINDOW_SECONDS,
     ) -> list[dict]:
         """Return recent nickname/join events for a member, newest first."""
-        db = await self._get_db()
         cutoff = int(discord.utils.utcnow().timestamp()) - window_seconds
-        if guild_id is None:
-            cursor = await db.execute(
-                """
-                SELECT event_type, old_display_name, new_display_name, created_at
-                FROM member_identity_events
-                WHERE user_id = ? AND created_at >= ?
-                ORDER BY created_at DESC
-                LIMIT 10
-                """,
-                (user_id, cutoff),
-            )
-        else:
-            cursor = await db.execute(
-                """
-                SELECT event_type, old_display_name, new_display_name, created_at
-                FROM member_identity_events
-                WHERE user_id = ? AND guild_id = ? AND created_at >= ?
-                ORDER BY created_at DESC
-                LIMIT 10
-                """,
-                (user_id, guild_id, cutoff),
-            )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "event_type": row[0],
-                "old_display_name": row[1],
-                "new_display_name": row[2],
-                "created_at": row[3],
-            }
-            for row in rows
-        ]
+        async with connect_async_db() as db:
+            if guild_id is None:
+                cursor = await db.execute(
+                    """
+                    SELECT event_type, old_display_name, new_display_name, created_at
+                    FROM member_identity_events
+                    WHERE user_id = ? AND created_at >= ?
+                    ORDER BY created_at DESC
+                    LIMIT 10
+                    """,
+                    (user_id, cutoff),
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    SELECT event_type, old_display_name, new_display_name, created_at
+                    FROM member_identity_events
+                    WHERE user_id = ? AND guild_id = ? AND created_at >= ?
+                    ORDER BY created_at DESC
+                    LIMIT 10
+                    """,
+                    (user_id, guild_id, cutoff),
+                )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "event_type": row[0],
+                    "old_display_name": row[1],
+                    "new_display_name": row[2],
+                    "created_at": row[3],
+                }
+                for row in rows
+            ]
 
     async def record_authorized_followup_visit(self, ign: str, origin_island: str, destination: str, user_id: int, guild_id: int | None, timestamp: int, island_type: str = 'sub') -> int | None:
         """Record an authorized follow-up visit linked to a previously identified traveler."""
-        db = await self._get_db()
-        cursor = await db.execute(
-            "INSERT INTO island_visits (ign, origin_island, destination, user_id, guild_id, authorized, timestamp, island_type) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
-            (ign, origin_island, destination, user_id, guild_id, timestamp, island_type)
-        )
-        await db.commit()
-        return cursor.lastrowid
+        async with connect_async_db() as db:
+            cursor = await db.execute(
+                "INSERT INTO island_visits (ign, origin_island, destination, user_id, guild_id, authorized, timestamp, island_type) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                (ign, origin_island, destination, user_id, guild_id, timestamp, island_type)
+            )
+            return cursor.lastrowid
 
     async def get_island_visits(self, user_id: int, guild_id: int, days: int = 30):
         """Get all island visits for a user within the specified number of days."""
-        db = await self._get_db()
         cutoff = int((discord.utils.utcnow() - datetime.timedelta(days=days)).timestamp())
-        cursor = await db.execute(
-            """SELECT id, ign, origin_island, destination, authorized, timestamp
-               FROM island_visits
-               WHERE user_id = ? AND guild_id = ? AND timestamp > ?
-               ORDER BY timestamp DESC""",
-            (user_id, guild_id, cutoff)
-        )
-        rows = await cursor.fetchall()
-        return [
-            {"id": r[0], "ign": r[1], "origin_island": r[2], "destination": r[3],
-             "authorized": bool(r[4]), "timestamp": r[5]}
-            for r in rows
-        ]
+        async with connect_async_db() as db:
+            cursor = await db.execute(
+                """SELECT id, ign, origin_island, destination, authorized, timestamp
+                   FROM island_visits
+                   WHERE user_id = ? AND guild_id = ? AND timestamp > ?
+                   ORDER BY timestamp DESC""",
+                (user_id, guild_id, cutoff)
+            )
+            rows = await cursor.fetchall()
+            return [
+                {"id": r[0], "ign": r[1], "origin_island": r[2], "destination": r[3],
+                 "authorized": bool(r[4]), "timestamp": r[5]}
+                for r in rows
+            ]
 
     async def record_island_visit(self, ign: str, origin_island: str, destination: str, found_members: list[discord.Member], guild_id: int | None, timestamp: int, authorized: int | None = None, island_type: str = 'sub') -> int | None:
         """Record an island visit (authorized or unauthorized) in the database. Returns the visit ID."""
-        db = await self._get_db()
-        visit_id = None
-        if found_members:
-            for member in found_members:
+        async with connect_async_db() as db:
+            visit_id = None
+            if found_members:
+                for member in found_members:
+                    cursor = await db.execute(
+                        "INSERT INTO island_visits (ign, origin_island, destination, user_id, guild_id, authorized, timestamp, island_type) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                        (ign, origin_island, destination, member.id, guild_id, timestamp, island_type)
+                    )
+                    visit_id = cursor.lastrowid
+            else:
+                auth_val = authorized if authorized is not None else 0
                 cursor = await db.execute(
-                    "INSERT INTO island_visits (ign, origin_island, destination, user_id, guild_id, authorized, timestamp, island_type) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
-                    (ign, origin_island, destination, member.id, guild_id, timestamp, island_type)
+                    "INSERT INTO island_visits (ign, origin_island, destination, user_id, guild_id, authorized, timestamp, island_type) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+                    (ign, origin_island, destination, guild_id, auth_val, timestamp, island_type)
                 )
                 visit_id = cursor.lastrowid
-        else:
-            auth_val = authorized if authorized is not None else 0
-            cursor = await db.execute(
-                "INSERT INTO island_visits (ign, origin_island, destination, user_id, guild_id, authorized, timestamp, island_type) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
-                (ign, origin_island, destination, guild_id, auth_val, timestamp, island_type)
-            )
-            visit_id = cursor.lastrowid
-        await db.commit()
-        return visit_id
+            return visit_id
 
     async def cleanup_expired_warnings(self):
         """Delete warnings older than WARN_EXPIRY_DAYS from the database."""
-        db = await self._get_db()
         cutoff = int((discord.utils.utcnow() - datetime.timedelta(days=WARN_EXPIRY_DAYS)).timestamp())
-        cursor = await db.execute(
-            "DELETE FROM warnings WHERE timestamp < ?", (cutoff,)
-        )
-        count = cursor.rowcount
-        await db.commit()
-        if count > 0:
-            logger.info(f"[FLIGHT] Expired {count} warning(s) older than {WARN_EXPIRY_DAYS} days.")
-        return count
+        async with connect_async_db() as db:
+            cursor = await db.execute(
+                "DELETE FROM warnings WHERE timestamp < ?", (cutoff,)
+            )
+            count = cursor.rowcount
+            if count > 0:
+                logger.info(f"[FLIGHT] Expired {count} warning(s) older than {WARN_EXPIRY_DAYS} days.")
+            return count
 
     async def _execute_punishment_internal(self, interaction, target, action_type, reason_text, duration_str, original_view, log_message):
         """Unified internal method for handling moderation actions."""
@@ -1873,12 +1882,11 @@ class FlightLoggerCog(commands.Cog):
                     visit_id = await self._get_recent_visit_id_by_ign(ign)
             if visit_id is not None:
                 # Identify the visitor in the island_visits record now that we know who they are
-                db = await self._get_db()
-                await db.execute(
-                    "UPDATE island_visits SET user_id = ? WHERE id = ? AND user_id IS NULL",
-                    (target.id, visit_id)
-                )
-                await db.commit()
+                async with connect_async_db() as db:
+                    await db.execute(
+                        "UPDATE island_visits SET user_id = ? WHERE id = ? AND user_id IS NULL",
+                        (target.id, visit_id)
+                    )
             await self.add_warning(target.id, guild.id, reason_text, mod.id, visit_id, action_type=action_type)
             # Use small delay to ensure DB consistency (though commit is awaited)
             new_count = await self.get_warn_count(target.id, guild.id, days=WARN_EXPIRY_DAYS)
@@ -1915,6 +1923,12 @@ class FlightLoggerCog(commands.Cog):
         await init_db()
         self.bot.add_view(TravelerActionView(bot=self.bot))
         self.bot.add_view(VerifiedFlightFlagView(bot=self.bot))
+        if not self.fetch_islands_task.is_running():
+            self.fetch_islands_task.start()
+        if not self.cleanup_warnings_task.is_running():
+            self.cleanup_warnings_task.start()
+        if not self.check_r1_reminders_task.is_running():
+            self.check_r1_reminders_task.start()
 
     async def _trigger_automatic_flag(
         self,
@@ -2246,101 +2260,128 @@ class FlightLoggerCog(commands.Cog):
 
             await xlog_channel.send(embed=xlog_embed, view=xlog_view)
 
+    async def _safe_wait_until_ready(self):
+        """Wait until bot cache and connection are fully initialized without raising RuntimeError."""
+        while getattr(self.bot, "_ready", None) is None or self.bot._ready is discord.utils.MISSING:
+            await asyncio.sleep(0.5)
+        await self.bot.wait_until_ready()
+
     def cog_unload(self):
         self.fetch_islands_task.cancel()
         self.cleanup_warnings_task.cancel()
         self.check_r1_reminders_task.cancel()
-        if self._db_conn:
-            asyncio.create_task(self._db_conn.close())
 
     @tasks.loop(hours=1)
     async def fetch_islands_task(self):
-        await self.fetch_islands()
+        try:
+            await self.fetch_islands()
+        except Exception as exc:
+            logger.error(f"[FLIGHT] Error in fetch_islands_task: {exc}", exc_info=True)
 
     @fetch_islands_task.before_loop
     async def before_fetch(self):
-        await self.bot.wait_until_ready()
-        await self.fetch_islands()
+        await self._safe_wait_until_ready()
+        try:
+            await self.fetch_islands()
+        except Exception as exc:
+            logger.error(f"[FLIGHT] Error in initial fetch_islands: {exc}", exc_info=True)
+
+    @fetch_islands_task.error
+    async def fetch_islands_task_error(self, error):
+        logger.error(f"[FLIGHT] Unhandled exception in fetch_islands_task: {error}", exc_info=True)
 
     @tasks.loop(hours=6)
     async def cleanup_warnings_task(self):
-        """Periodically remove warnings older than WARN_EXPIRY_DAYS."""
-        await self.cleanup_expired_warnings()
+        """Periodically remove warnings older than WARN_EXPIRY_DAYS and prune in-memory caches."""
+        try:
+            await self.cleanup_expired_warnings()
+            self._prune_stale_caches()
+        except Exception as exc:
+            logger.error(f"[FLIGHT] Error in cleanup_warnings_task: {exc}", exc_info=True)
 
     @cleanup_warnings_task.before_loop
     async def before_cleanup(self):
-        await self.bot.wait_until_ready()
+        await self._safe_wait_until_ready()
+
+    @cleanup_warnings_task.error
+    async def cleanup_warnings_task_error(self, error):
+        logger.error(f"[FLIGHT] Unhandled exception in cleanup_warnings_task: {error}", exc_info=True)
 
     @tasks.loop(minutes=5)
     async def check_r1_reminders_task(self):
         """Periodically check for R1 warnings that have hit the 24 hour mark."""
-        db = await self._get_db()
-        # Look for R1 warnings older than 23.95 hours and newer than 48 hours to avoid super old ones
-        cutoff_max = int((discord.utils.utcnow() - datetime.timedelta(hours=23.95)).timestamp())
-        cutoff_min = int((discord.utils.utcnow() - datetime.timedelta(hours=48)).timestamp())
-        
-        cursor = await db.execute(
-            """SELECT id, user_id, guild_id, timestamp, visit_id, reason 
-               FROM warnings 
-               WHERE action_type = 'WARN' 
-                 AND (reason LIKE '%Sub Top Rule%' OR reason LIKE '%Sub Rule #1%')
-                 AND r1_reminder_sent = 0
-                 AND timestamp >= ? AND timestamp <= ?""",
-            (cutoff_min, cutoff_max)
-        )
-        rows = await cursor.fetchall()
-        for row in rows:
-            warning_id, user_id, guild_id, timestamp, visit_id, reason = row
-            guild = self.bot.get_guild(guild_id)
-            if not guild: continue
-            
-            member = guild.get_member(user_id)
-            if not member:
-                try:
-                    member = await guild.fetch_member(user_id)
-                except discord.HTTPException:
-                    member = None
-            if not member:
-                # Can't find member, mark as sent anyway
-                await db.execute("UPDATE warnings SET r1_reminder_sent = 1 WHERE id = ?", (warning_id,))
-                await db.commit()
-                continue
-                
-            x_channel = self.bot.get_channel(Config.XLOG_VERBOSE_CHANNEL_ID)
-            if x_channel:
-                now = datetime.datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc)
-                case_val = f"FL-{now.strftime('%y%m')}-{hex(int(now.timestamp()))[2:][-4:].upper()}"
-                
-                desc = (
-                    f"**{_format_user_for_embed(member)}** was warned for {reason} 24 hours ago (Case `{case_val}`).\n\n"
-                    f"**Action Required:** If they have not contacted the mod team regarding their warning, they are due for a ban at the 24-hour mark."
+        try:
+            cutoff_max = int((discord.utils.utcnow() - datetime.timedelta(hours=23.95)).timestamp())
+            cutoff_min = int((discord.utils.utcnow() - datetime.timedelta(hours=48)).timestamp())
+
+            async with connect_async_db() as db:
+                cursor = await db.execute(
+                    """SELECT id, user_id, guild_id, timestamp, visit_id, reason 
+                       FROM warnings 
+                       WHERE action_type = 'WARN' 
+                         AND (reason LIKE '%Sub Top Rule%' OR reason LIKE '%Sub Rule #1%')
+                         AND r1_reminder_sent = 0
+                         AND timestamp >= ? AND timestamp <= ?""",
+                    (cutoff_min, cutoff_max)
                 )
-                
-                embed = discord.Embed(
-                    title="⏰ R1 Ban Deadline Approaching",
-                    description=desc,
-                    color=COLOR_ALERT,
-                    timestamp=discord.utils.utcnow()
-                )
-                
-                embed.add_field(name="Traveler (IGN)", value=f"```yaml\n{member.display_name}```", inline=True)
-                embed.add_field(name="Status", value="<:Cho_Investigate:1474310726381338666> **PENDING REVIEW**", inline=True)
-                if visit_id is not None:
-                    embed.add_field(name="Visit ID", value=f"`#{visit_id}`", inline=True)
-                    
-                view = TravelerActionView(bot=self.bot, ign=member.display_name, visit_id=visit_id)
-                for item in list(view.children):
-                    if getattr(item, 'custom_id', None) not in ['fl_ban', 'fl_dismiss']:
-                        view.remove_item(item)
-                        
-                await x_channel.send(embed=embed, view=view)
-            
-            await db.execute("UPDATE warnings SET r1_reminder_sent = 1 WHERE id = ?", (warning_id,))
-            await db.commit()
+                rows = await cursor.fetchall()
+                for row in rows:
+                    warning_id, user_id, guild_id, timestamp, visit_id, reason = row
+                    guild = self.bot.get_guild(guild_id)
+                    if not guild:
+                        continue
+
+                    member = guild.get_member(user_id)
+                    if not member:
+                        try:
+                            member = await guild.fetch_member(user_id)
+                        except discord.HTTPException:
+                            member = None
+                    if not member:
+                        # Can't find member, mark as sent anyway
+                        await db.execute("UPDATE warnings SET r1_reminder_sent = 1 WHERE id = ?", (warning_id,))
+                        continue
+
+                    x_channel = self.bot.get_channel(Config.XLOG_VERBOSE_CHANNEL_ID)
+                    if x_channel:
+                        now = datetime.datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc)
+                        case_val = f"FL-{now.strftime('%y%m')}-{hex(int(now.timestamp()))[2:][-4:].upper()}"
+
+                        desc = (
+                            f"**{_format_user_for_embed(member)}** was warned for {reason} 24 hours ago (Case `{case_val}`).\n\n"
+                            f"**Action Required:** If they have not contacted the mod team regarding their warning, they are due for a ban at the 24-hour mark."
+                        )
+
+                        embed = discord.Embed(
+                            title="⏰ R1 Ban Deadline Approaching",
+                            description=desc,
+                            color=COLOR_ALERT,
+                            timestamp=discord.utils.utcnow()
+                        )
+
+                        embed.add_field(name="Traveler (IGN)", value=f"```yaml\n{member.display_name}```", inline=True)
+                        embed.add_field(name="Status", value="<:Cho_Investigate:1474310726381338666> **PENDING REVIEW**", inline=True)
+                        if visit_id is not None:
+                            embed.add_field(name="Visit ID", value=f"`#{visit_id}`", inline=True)
+
+                        view = TravelerActionView(bot=self.bot, ign=member.display_name, visit_id=visit_id)
+                        for item in list(view.children):
+                            if getattr(item, 'custom_id', None) not in ['fl_ban', 'fl_dismiss']:
+                                view.remove_item(item)
+
+                        await x_channel.send(embed=embed, view=view)
+
+                    await db.execute("UPDATE warnings SET r1_reminder_sent = 1 WHERE id = ?", (warning_id,))
+        except Exception as exc:
+            logger.error(f"[FLIGHT] Error in check_r1_reminders_task: {exc}", exc_info=True)
 
     @check_r1_reminders_task.before_loop
     async def before_check_r1_reminders(self):
-        await self.bot.wait_until_ready()
+        await self._safe_wait_until_ready()
+
+    @check_r1_reminders_task.error
+    async def check_r1_reminders_task_error(self, error):
+        logger.error(f"[FLIGHT] Unhandled exception in check_r1_reminders_task: {error}", exc_info=True)
 
     async def fetch_islands(self):
         """Fetch island channels from Discord sub-category"""
@@ -2604,6 +2645,8 @@ class FlightLoggerCog(commands.Cog):
         return ign_log_clean in ign_opts and island_log_clean in island_opts
 
     def find_matching_members(self, guild, ign_log_clean, island_log_clean):
+        if not guild:
+            return []
         exact_members = []
         for member in guild.members:
             ign_opts, island_opts = self.parse_member_nick(member.display_name)
@@ -2620,6 +2663,8 @@ class FlightLoggerCog(commands.Cog):
             {member, ign_opts, island_opts, ign_match, island_match, full_match}
         Sorted: IGN matches first, then no match.
         """
+        if not guild:
+            return []
         candidates = []
         for member in guild.members:
             ign_opts, island_opts = self.parse_member_nick(member.display_name)
@@ -2686,8 +2731,14 @@ class FlightLoggerCog(commands.Cog):
     async def _process_flight_log(self, guild, ign_raw, island_raw, dest_raw, ign_norm, isl_norm, message_url=None, message_content=None):
         """Background task: look up members then run the full log pipeline."""
         try:
+            target_guild = guild or self.bot.get_guild(Config.GUILD_ID)
+            if target_guild and not target_guild.chunked:
+                try:
+                    await target_guild.chunk()
+                except Exception as chunk_err:
+                    logger.warning(f"[FLIGHT] Guild chunking failed/timed out: {chunk_err}")
             found = await asyncio.to_thread(
-                self.find_matching_members, guild, ign_norm, isl_norm
+                self.find_matching_members, target_guild, ign_norm, isl_norm
             )
             await self.log_result(found, "JOINING", ign_raw, island_raw, dest_raw, island_type='sub', message_url=message_url, message_content=message_content)
         except Exception as e:
@@ -2984,7 +3035,18 @@ class FlightLoggerCog(commands.Cog):
 
                 # Check if there is already a pending alert for this IGN+destination to avoid flooding the channel
                 existing_msg = None
-                existing_msg_id = self._pending_alerts.get(alert_key)
+                pending_entry = self._pending_alerts.get(alert_key)
+                existing_msg_id = None
+                if pending_entry:
+                    if isinstance(pending_entry, tuple):
+                        cached_id, cached_ts = pending_entry
+                        if (alert_ts - cached_ts) <= MAX_ALERT_MERGE_SECONDS:
+                            existing_msg_id = cached_id
+                        else:
+                            self._pending_alerts.pop(alert_key, None)
+                    else:
+                        existing_msg_id = pending_entry
+
                 if existing_msg_id:
                     try:
                         existing_msg = await output_channel.fetch_message(existing_msg_id)
@@ -2996,8 +3058,10 @@ class FlightLoggerCog(commands.Cog):
                             )
                             if status_field is None or "PENDING REVIEW" not in status_field.value:
                                 existing_msg = None
+                                self._pending_alerts.pop(alert_key, None)
                     except discord.NotFound:
                         existing_msg = None
+                        self._pending_alerts.pop(alert_key, None)
 
                 xlog_channel = self.bot.get_channel(Config.XLOG_VERBOSE_CHANNEL_ID)
                 guild_icon = guild.icon.url if guild and guild.icon else None
@@ -3031,6 +3095,7 @@ class FlightLoggerCog(commands.Cog):
                     for name, value, inline in updated_fields:
                         embed.add_field(name=name, value=value, inline=inline)
                     await existing_msg.edit(embed=embed)
+                    self._pending_alerts[alert_key] = (existing_msg.id, alert_ts)
                     logger.info(f"[FLIGHT] Updated existing alert for {ign} (re-join attempt #{rejoin_count})")
 
                     # Post re-join notification to xlog channel
@@ -3106,7 +3171,7 @@ class FlightLoggerCog(commands.Cog):
 
                     view = TravelerActionView(self.bot, ign, visit_id=visit_id)
                     sent_msg = await output_channel.send(embed=embed, view=view)
-                    self._pending_alerts[alert_key] = sent_msg.id
+                    self._pending_alerts[alert_key] = (sent_msg.id, alert_ts)
 
                     # Post unknown traveler notification to xlog channel
                     if xlog_channel:
@@ -3983,7 +4048,7 @@ class FreeFlightCog(commands.Cog, name="FreeFlightLogger"):
 
         # Delegate to FlightLoggerCog.record_island_visit to avoid duplicating
         # DB logic; fall back to a direct insert if the cog is not loaded.
-        flight_cog = self.bot.cogs.get("FlightLogger")
+        flight_cog = self.bot.get_cog("FlightLoggerCog")
         if flight_cog is not None:
             await flight_cog.record_island_visit(
                 ign_raw, island_raw, dest_raw, [], guild_id, visit_ts,
