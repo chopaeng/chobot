@@ -7,6 +7,7 @@ Handles Discord commands for item and villager search with rich embeds
 import asyncio
 import contextlib
 import os
+import shutil
 import subprocess
 import time
 import re
@@ -14,6 +15,7 @@ import random
 import logging
 from datetime import datetime, timezone, timedelta
 from itertools import cycle
+from pathlib import Path
 
 import discord
 import requests
@@ -1060,6 +1062,31 @@ class RebootConfirmView(discord.ui.View):
     async def on_timeout(self) -> None:
         self.result = None
         self._disable_all()
+
+
+def _find_git_executable() -> str | None:
+    """Find git executable from PATH or common installation paths."""
+    git_cmd = shutil.which("git")
+    if git_cmd:
+        return git_cmd
+
+    candidates = [
+        # Linux / Unix
+        "/usr/bin/git",
+        "/usr/local/bin/git",
+        "/bin/git",
+        # Windows
+        r"C:\Program Files\Git\cmd\git.exe",
+        r"C:\Program Files\Git\bin\git.exe",
+        r"C:\Program Files (x86)\Git\cmd\git.exe",
+        r"C:\Program Files (x86)\Git\bin\git.exe",
+        os.path.expanduser(r"~\AppData\Local\Programs\Git\cmd\git.exe"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and (os.name == "nt" or os.access(c, os.X_OK)):
+            return c
+    return None
+
 
 class DiscordCommandCog(commands.Cog):
     """Cog for Discord treasure hunt commands"""
@@ -4709,21 +4736,32 @@ class DiscordCommandCog(commands.Cog):
         except Exception as exc:
             logger.warning("[DISCORD] Pre-update backup failed: %s", exc)
 
+        project_root = Path(__file__).resolve().parent.parent
+        git_bin = _find_git_executable()
+        if not git_bin:
+            await ctx.reply(
+                "❌ **Git executable not found**: `git` is not installed or not in PATH on the server running ChoBot.\n"
+                "Please install Git on the host (e.g. `sudo apt update && sudo apt install -y git` on Linux) to use `/update`."
+            )
+            return
+
         # Run git pull, forcing English output for reliable message parsing
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
                 lambda: subprocess.run(
-                    ['git', 'pull'],
+                    [git_bin, 'pull'],
                     capture_output=True,
                     text=True,
                     timeout=30,
+                    cwd=str(project_root),
                     env={**os.environ, 'LANG': 'C', 'LC_ALL': 'C'},
                 )
             )
             git_output = result.stdout.strip() or result.stderr.strip() or "No output."
         except Exception as e:
+            logger.exception("[DISCORD] Git pull failed: %s", e)
             await ctx.reply(f"Git pull failed: `{e}`")
             return
 

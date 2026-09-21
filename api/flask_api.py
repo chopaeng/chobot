@@ -3101,7 +3101,16 @@ def get_order_bot_status():
     # Forward all fields as-is from Sinta — the frontend will pick what it needs.
     # Only enrich with defaults for critical fields the frontend relies on.
     if isinstance(data, dict):
-        if data.get("success"):
+        island_name = str(data.get("island_name") or "").strip()
+        if island_name.lower().rstrip(".") == "no town name yet":
+            data["success"] = False
+            data["is_running"] = False
+            data["accepting_commands"] = False
+            data.setdefault("error", "Bot is currently offline (no town loaded).")
+            data.setdefault("queue_count", 0)
+            data.setdefault("visitor_list", [])
+            data.setdefault("visitors_count", 0)
+        elif data.get("success"):
             data.setdefault("island_name", getattr(Config, "ORDER_BOT_ISLAND", "Sinta"))
             data.setdefault("accepting_commands", True)
             data.setdefault("queue_count", 0)
