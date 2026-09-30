@@ -3994,9 +3994,16 @@ class DiscordCommandCog(commands.Cog):
                 )
 
         # Check island bot presence first (fast, no API call)
+        # Ensure role members are populated (large guilds may need chunking)
         island_bot_role = guild.get_role(Config.ISLAND_BOT_ROLE_ID) if Config.ISLAND_BOT_ROLE_ID else None
         island_bot = None
         if island_bot_role:
+            # If role has no members, the cache may be stale — try chunking once
+            if not island_bot_role.members and not guild.chunked:
+                try:
+                    await guild.chunk(cache=True)
+                except Exception:
+                    pass
             target = clean_text(f"chobot {island}")
             for member in island_bot_role.members:
                 if member.bot and clean_text(member.display_name) == target:
@@ -4058,7 +4065,7 @@ class DiscordCommandCog(commands.Cog):
         except Exception as exc:
             logger.error(f"[DISCORD] Failed to send order island status alert for {island_display}: {exc}")
 
-    @tasks.loop(seconds=300)
+    @tasks.loop(seconds=60)
     async def island_monitor_loop(self):
         """Background task: detect island down/up transitions and notify in channel."""
         guild = self.bot.get_guild(Config.GUILD_ID)

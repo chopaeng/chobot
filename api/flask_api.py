@@ -747,7 +747,7 @@ def _fire_dodo_webhook(
             "url": "https://i.ibb.co/wybN7Xn/lg4jVMT.gif"
         },
         "footer": {
-            "text": "Chopaeng Campâ„¢ â€¢ Dodo Log",
+            "text": "Chopaeng Camp - Dodo Log",
             "icon_url": "https://www.chopaeng.com/assets/logo-C5oO0bbj.webp"
         },
         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -2043,9 +2043,18 @@ def get_islands():
             isl["access_source"] = access_source
             if isl.get("name"):
                 db_map[isl["name"].upper()] = isl
-        # Load Discord bot presence data
-        bot_rows = db.execute("SELECT island_id, is_online FROM island_bot_status").fetchall()
+        # Load Discord bot presence data (ignore records older than 10 minutes)
+        _bot_status_stale_secs = 600
+        _now_ts = time.time()
+        bot_rows = db.execute("SELECT island_id, is_online, updated_at FROM island_bot_status").fetchall()
         for r in bot_rows:
+            try:
+                from datetime import timezone as _tz
+                updated = datetime.fromisoformat(r["updated_at"]).replace(tzinfo=_tz.utc).timestamp()
+                if _now_ts - updated > _bot_status_stale_secs:
+                    continue  # Stale record — omit so frontend shows unknown
+            except Exception:
+                pass
             discord_status[r["island_id"]] = bool(r["is_online"])
     except Exception:
         logger.exception("Failed to load island metadata from DB for /api/islands")
@@ -2258,8 +2267,18 @@ def get_island_visitors(name):
     discord_status = {}
     db = get_db()
     try:
-        bot_rows = db.execute("SELECT island_id, is_online FROM island_bot_status").fetchall()
+        # Load Discord bot presence data (ignore records older than 10 minutes)
+        _bot_status_stale_secs = 600
+        _now_ts = time.time()
+        bot_rows = db.execute("SELECT island_id, is_online, updated_at FROM island_bot_status").fetchall()
         for r in bot_rows:
+            try:
+                from datetime import timezone as _tz
+                updated = datetime.fromisoformat(r["updated_at"]).replace(tzinfo=_tz.utc).timestamp()
+                if _now_ts - updated > _bot_status_stale_secs:
+                    continue  # Stale record — omit so frontend shows unknown
+            except Exception:
+                pass
             discord_status[r["island_id"]] = bool(r["is_online"])
     except Exception:
         pass

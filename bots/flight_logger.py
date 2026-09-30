@@ -962,8 +962,8 @@ class TravelerActionView(discord.ui.View):
     async def investigate_action(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
-            return  # Stale interaction, silently ignore
+        except (discord.NotFound, discord.HTTPException):
+            return  # Stale or already-acknowledged interaction, silently ignore
 
         ign = self.ign or self._get_ign_from_embed(interaction.message.embeds[0])
         mod = interaction.user
@@ -1010,8 +1010,8 @@ class TravelerActionView(discord.ui.View):
     async def confirm_action(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
-            return  # Stale interaction, silently ignore
+        except (discord.NotFound, discord.HTTPException):
+            return  # Stale or already-acknowledged interaction, silently ignore
         ign = self.ign or self._get_ign_from_embed(interaction.message.embeds[0])
         # Show confirmation dialog
         confirm_view = AdmitConfirmView(self, ign, interaction.message)
@@ -1025,7 +1025,7 @@ class TravelerActionView(discord.ui.View):
     async def warn_action(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
+        except (discord.NotFound, discord.HTTPException):
             return
         view = PunishmentBuilderView("WARN", self, log_message=interaction.message)
         await interaction.followup.send("<:Cho_Warn:1456712416271405188> **Build Warning:**", view=view, ephemeral=True)
@@ -1034,7 +1034,7 @@ class TravelerActionView(discord.ui.View):
     async def kick_action(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
+        except (discord.NotFound, discord.HTTPException):
             return
         view = PunishmentBuilderView("KICK", self, log_message=interaction.message)
         await interaction.followup.send("<:Cho_Kick:1456714701630214349> **Build Kick:**", view=view, ephemeral=True)
@@ -1043,7 +1043,7 @@ class TravelerActionView(discord.ui.View):
     async def ban_action(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
+        except (discord.NotFound, discord.HTTPException):
             return
         view = PunishmentBuilderView("BAN", self, log_message=interaction.message)
         await interaction.followup.send("<:Cho_Ban:1473530840725061793> **Build Ban:**", view=view, ephemeral=True)
@@ -1053,7 +1053,7 @@ class TravelerActionView(discord.ui.View):
         """Dismiss the alert as a false positive or non-threat."""
         try:
             await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
+        except (discord.NotFound, discord.HTTPException):
             return
         ign = self.ign or self._get_ign_from_embed(interaction.message.embeds[0])
         msg = f"**{ign or 'Visitor'}** dismissed."
@@ -1075,7 +1075,7 @@ class TravelerActionView(discord.ui.View):
         """Add a note to the alert without taking action."""
         try:
             await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
+        except (discord.NotFound, discord.HTTPException):
             return
         view = NoteBuilderView(self, interaction.message)
         await interaction.followup.send(
@@ -1318,7 +1318,7 @@ class VerifiedFlightFlagView(discord.ui.View):
         """Escalate a verified flight to a manual alert with confirmation."""
         try:
             await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
+        except (discord.NotFound, discord.HTTPException):
             return
 
         try:
