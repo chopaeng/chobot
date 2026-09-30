@@ -24,7 +24,7 @@ from discord.ext import commands, tasks
 from thefuzz import process, fuzz
 
 from utils.config import Config
-from utils.database import connect_db
+from utils.database import connect_db, connect_async_db
 from utils.helpers import normalize_text, get_best_suggestions, clean_text
 from utils.island_access import configured_subscription_role_ids, is_mod, resolved_island_required_roles
 from utils.nookipedia import NookipediaClient
@@ -130,6 +130,32 @@ def build_island_status_sticky_payload(offline_islands: list[str]) -> tuple[str,
     return title, description, field_value, color
 
 
+async def _async_upsert_bot_statuses(records: list[tuple[str, str, bool]]) -> None:
+    """Persist Discord bot online/offline status for multiple islands asynchronously.
+
+    Writes to the ``island_bot_status`` table in a single background transaction
+    so the event loop is never blocked.
+    """
+    if not records:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        async with connect_async_db() as db:
+            for island_id, island_name, is_online in records:
+                await db.execute(
+                    """INSERT INTO island_bot_status (island_id, island_name, is_online, updated_at)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(island_id) DO UPDATE SET
+                           island_name=excluded.island_name,
+                           is_online=excluded.is_online,
+                           updated_at=excluded.updated_at""",
+                    (island_id, island_name, 1 if is_online else 0, now_iso),
+                )
+            await db.commit()
+    except Exception as exc:
+        logger.error(f"[DISCORD] Failed to batch write island_bot_status: {exc}")
+
+
 def _upsert_bot_status(island_id: str, island_name: str, is_online: bool) -> None:
     """Persist the Discord bot online/offline status for an island to the DB.
 
@@ -137,8 +163,7 @@ def _upsert_bot_status(island_id: str, island_name: str, is_online: bool) -> Non
     live Discord presence data without making Discord API calls itself.
     """
     try:
-        conn = connect_db()
-        try:
+        with connect_db() as conn:
             conn.execute(
                 """INSERT INTO island_bot_status (island_id, island_name, is_online, updated_at)
                    VALUES (?, ?, ?, ?)
@@ -149,8 +174,6 @@ def _upsert_bot_status(island_id: str, island_name: str, is_online: bool) -> Non
                 (island_id, island_name, 1 if is_online else 0, datetime.now(timezone.utc).isoformat()),
             )
             conn.commit()
-        finally:
-            conn.close()
     except Exception as exc:
         logger.error(f"[DISCORD] Failed to write island_bot_status for {island_name}: {exc}")
 
@@ -224,28 +247,60 @@ def _set_setting(key: str, value: str) -> None:
         logger.error(f"[DISCORD] Failed to set setting '{key}': {exc}")
 
 
+_SEEN_MESSAGE_IDS = set()
+_last_claim_cleanup = 0.0
+
+
+async def _async_try_claim_command(message_id: int) -> bool:
+    """Attempt to claim a message ID for command processing asynchronously.
+
+    Uses an in-memory set fast path and SQLite unique constraint for cross-instance
+    deduplication, avoiding blocking the asyncio event loop thread.
+    """
+    global _last_claim_cleanup
+    if message_id in _SEEN_MESSAGE_IDS:
+        return False
+    _SEEN_MESSAGE_IDS.add(message_id)
+    if len(_SEEN_MESSAGE_IDS) > 5000:
+        _SEEN_MESSAGE_IDS.clear()
+
+    try:
+        now = time.time()
+        async with connect_async_db() as conn:
+            if now - _last_claim_cleanup > 300:
+                await conn.execute(
+                    "DELETE FROM command_claims WHERE claimed_at < ?",
+                    (now - COMMAND_CLAIM_EXPIRY_SECONDS,),
+                )
+                _last_claim_cleanup = now
+            cursor = await conn.execute(
+                "INSERT OR IGNORE INTO command_claims (message_id, claimed_at) VALUES (?, ?)",
+                (message_id, now),
+            )
+            return cursor.rowcount > 0
+    except Exception as exc:
+        logger.error(f"[DISCORD] command_claims check failed for {message_id}: {exc}")
+        return True
+
 
 def _try_claim_command(message_id: int) -> bool:
-    """Attempt to claim a message ID for command processing.
+    """Attempt to claim a message ID for command processing (synchronous fallback)."""
+    global _last_claim_cleanup
+    if message_id in _SEEN_MESSAGE_IDS:
+        return False
+    _SEEN_MESSAGE_IDS.add(message_id)
+    if len(_SEEN_MESSAGE_IDS) > 5000:
+        _SEEN_MESSAGE_IDS.clear()
 
-    Uses a SQLite unique constraint so that only one bot instance (or one
-    invocation within the same instance) can process a given Discord message.
-
-    Returns True if this call is the first to claim the message (caller should
-    proceed), False if it was already claimed (caller should skip).
-    On any database error, returns True so the command is never silently lost.
-    """
     try:
         now = time.time()
         with connect_db() as conn:
-            conn.execute(
-                "DELETE FROM command_claims WHERE claimed_at < ?",
-                (now - COMMAND_CLAIM_EXPIRY_SECONDS,),
-            )
-            # INSERT OR IGNORE silently does nothing when the PRIMARY KEY already
-            # exists (i.e. another instance already claimed this message_id).
-            # cursor.rowcount is 1 on a successful insert and 0 on a no-op, so
-            # it reliably distinguishes "first claim" from "duplicate".
+            if now - _last_claim_cleanup > 300:
+                conn.execute(
+                    "DELETE FROM command_claims WHERE claimed_at < ?",
+                    (now - COMMAND_CLAIM_EXPIRY_SECONDS,),
+                )
+                _last_claim_cleanup = now
             cursor = conn.execute(
                 "INSERT OR IGNORE INTO command_claims (message_id, claimed_at) VALUES (?, ?)",
                 (message_id, now),
@@ -1145,6 +1200,16 @@ class DiscordCommandCog(commands.Cog):
         sub_online = 0
         if include_sub:
             await self.fetch_islands()
+            dodo_codes = {}
+            try:
+                async with connect_async_db() as db:
+                    cur = await db.execute("SELECT id, dodo_code FROM islands")
+                    for r in await cur.fetchall():
+                        if r.get("id"):
+                            dodo_codes[clean_text(r.get("id"))] = r.get("dodo_code")
+            except Exception as exc:
+                logger.warning(f"[DISCORD] Could not prefetch island dodo codes: {exc}")
+
             for island in Config.SUB_ISLANDS:
                 island_clean = clean_text(island)
                 channel_id = self.sub_island_lookup.get(island_clean)
@@ -1179,13 +1244,10 @@ class DiscordCommandCog(commands.Cog):
 
                 island_up = False
                 status_reason = ""
-                with connect_db() as conn:
-                    row = conn.execute("SELECT dodo_code FROM islands WHERE id = ?", (island_clean,)).fetchone()
-                    if row:
-                        dodo_code = row.get("dodo_code")
-                        if dodo_code and str(dodo_code).strip() not in ["", "00000", "-----", "GETTIN'"]:
-                            island_up = True
-                            status_reason = "Dodo code active"
+                dodo_code = dodo_codes.get(island_clean)
+                if dodo_code and str(dodo_code).strip() not in ["", "00000", "-----", "GETTIN'"]:
+                    island_up = True
+                    status_reason = "Dodo code active"
 
                 if island_up:
                     sub_results.append((island, "✅", status_reason, channel_id))
@@ -1340,6 +1402,7 @@ class DiscordCommandCog(commands.Cog):
         temp_lookup = {}
         fetched_islands = []
         count = 0
+        updates = []
 
         for channel in category.channels:
             if channel.id == Config.IGNORE_CHANNEL_ID:
@@ -1367,15 +1430,20 @@ class DiscordCommandCog(commands.Cog):
                         if target.name != "@everyone":
                             req_roles.append(str(target.id))
                 
-                try:
-                    import json
-                    with connect_db() as conn:
-                        conn.execute(
+                updates.append((json.dumps(req_roles), str(channel.id), island_clean.upper()))
+
+        if updates:
+            try:
+                from utils.database import connect_async_db
+                async with connect_async_db() as db:
+                    for roles_json, chan_id, isl_name in updates:
+                        await db.execute(
                             "UPDATE islands SET required_roles = ?, channel_id = ? WHERE UPPER(name) = ?",
-                            (json.dumps(req_roles), str(channel.id), island_clean.upper())
+                            (roles_json, chan_id, isl_name)
                         )
-                except Exception as e:
-                    logger.error(f"[DISCORD] Failed to save required_roles for {island_clean}: {e}")
+                    await db.commit()
+            except Exception as e:
+                logger.error(f"[DISCORD] Failed to batch save required_roles: {e}")
 
         self.sub_island_lookup = temp_lookup
 
@@ -1430,6 +1498,8 @@ class DiscordCommandCog(commands.Cog):
         self.island_monitor_loop.cancel()
         self.free_dodo_board_loop.cancel()
         self.island_status_sticky_loop.cancel()
+        if hasattr(self.bot, "change_status_loop") and self.bot.change_status_loop.is_running():
+            self.bot.change_status_loop.cancel()
 
     async def _refresh_island_status_sticky_message(
             self,
@@ -2164,7 +2234,8 @@ class DiscordCommandCog(commands.Cog):
     @free_dodo_board_loop.before_loop
     async def before_free_dodo_board_loop(self):
         """Wait until ready before starting the public Free Dodo board."""
-        await self.bot.wait_until_ready()
+        while not self.bot.is_ready():
+            await asyncio.sleep(0.5)
         await self.fetch_free_islands()
 
     @tasks.loop(seconds=60)
@@ -2185,7 +2256,8 @@ class DiscordCommandCog(commands.Cog):
     @island_status_sticky_loop.before_loop
     async def before_island_status_sticky_loop(self):
         """Wait until ready before starting the island status sticky loop."""
-        await self.bot.wait_until_ready()
+        while not self.bot.is_ready():
+            await asyncio.sleep(0.5)
         # No manual refresh here — tasks.loop runs the body immediately once
         # before_loop finishes, so the first iteration above handles both
         # cleanup and the initial post.
@@ -3313,7 +3385,8 @@ class DiscordCommandCog(commands.Cog):
         self.pending_dodo_waiters.setdefault(island_clean_key, []).append(ctx.author)
         try:
             island_msg = await self.bot.wait_for('message', check=dodo_check, timeout=ISLAND_BOT_INTERCEPT_TIMEOUT)
-            await island_msg.delete()
+            with contextlib.suppress(discord.HTTPException):
+                await island_msg.delete()
             reply_msg = await ctx.reply(embed=self._build_dodo_sent_embed(ctx))
             logger.info(f"[DISCORD] Intercepted and redesigned !sd response for {ctx.channel.name}")
             await self._log_dodo_request_to_xlog(ctx, reply_msg)
@@ -3361,7 +3434,8 @@ class DiscordCommandCog(commands.Cog):
                 if m:
                     visitor_lines.append(m.group(1).strip())
 
-            await island_msg.delete()
+            with contextlib.suppress(discord.HTTPException):
+                await island_msg.delete()
             await ctx.reply(embed=self._build_visitors_embed(ctx, island_name, visitor_lines))
             logger.info(f"[DISCORD] Intercepted and redesigned !visitors response for {ctx.channel.name}")
         except asyncio.TimeoutError:
@@ -3405,7 +3479,8 @@ class DiscordCommandCog(commands.Cog):
             else:
                 villagers_list = []
 
-            await island_msg.delete()
+            with contextlib.suppress(discord.HTTPException):
+                await island_msg.delete()
             await ctx.reply(embed=self._build_villagers_embed(ctx, island_name, villagers_list))
             logger.info(f"[DISCORD] Intercepted and redesigned !villagers response for {ctx.channel.name}")
         except asyncio.TimeoutError:
@@ -3444,7 +3519,8 @@ class DiscordCommandCog(commands.Cog):
 
         try:
             island_msg = await self.bot.wait_for('message', check=drop_check, timeout=ISLAND_BOT_INTERCEPT_TIMEOUT)
-            await island_msg.delete()
+            with contextlib.suppress(discord.HTTPException):
+                await island_msg.delete()
             await ctx.reply(embed=self._build_drop_embed(ctx))
             logger.info(f"[DISCORD] Intercepted and redesigned !drop response for {ctx.channel.name}")
         except asyncio.TimeoutError:
@@ -3996,6 +4072,7 @@ class DiscordCommandCog(commands.Cog):
                 logger.error(f"[DISCORD] island_monitor_loop failed to fetch islands: {e}")
                 return
         self._refresh_order_island_lookup()
+        bot_status_records: list[tuple[str, str, bool]] = []
 
         for island in Config.SUB_ISLANDS:
             island_clean = clean_text(island)
@@ -4013,8 +4090,8 @@ class DiscordCommandCog(commands.Cog):
                 logger.error(f"[DISCORD] island_monitor_loop error checking {island}: {e}")
                 continue
 
-            # Persist current status to the database so the REST API can expose it
-            _upsert_bot_status(island.lower(), island, is_online)
+            # Record status for background async batch DB persist
+            bot_status_records.append((island.lower(), island, is_online))
 
             previous = self.island_down_states.get(island_clean)  # None = first run
 
@@ -4095,7 +4172,7 @@ class DiscordCommandCog(commands.Cog):
                 except Exception as e:
                     logger.error(f"[DISCORD] island_monitor_loop error checking free island {island}: {e}")
                     continue
-                _upsert_bot_status(island.lower(), island, is_online)
+                bot_status_records.append((island.lower(), island, is_online))
 
                 free_was_down = self.island_down_states.get(f"free:{free_island_clean}")
                 if free_was_down is None:
@@ -4119,7 +4196,7 @@ class DiscordCommandCog(commands.Cog):
                 except Exception as e:
                     logger.error(f"[DISCORD] island_monitor_loop error checking order island {island}: {e}")
                     continue
-                _upsert_bot_status(island.lower(), island, is_online)
+                bot_status_records.append((island.lower(), island, is_online))
 
                 state_key = f"order:{order_island_clean}"
                 order_was_down = self.island_down_states.get(state_key)
@@ -4133,6 +4210,10 @@ class DiscordCommandCog(commands.Cog):
                     self.island_down_states[state_key] = False
                     await self._send_order_island_status_alert(channel, island, online=True)
 
+        # Batch update all island statuses asynchronously so event loop is not blocked
+        if bot_status_records:
+            await _async_upsert_bot_statuses(bot_status_records)
+
         # Sticky message is managed by island_status_sticky_loop; just
         # request a non-reposting (edit-in-place) refresh so the embed
         # data stays current without sending duplicate messages.
@@ -4144,7 +4225,8 @@ class DiscordCommandCog(commands.Cog):
     @island_monitor_loop.before_loop
     async def before_island_monitor_loop(self):
         """Wait until bot is ready before starting the island monitor."""
-        await self.bot.wait_until_ready()
+        while not self.bot.is_ready():
+            await asyncio.sleep(0.5)
         await self.fetch_islands()
         await self.fetch_free_islands()
         self._refresh_order_island_lookup()
@@ -5533,16 +5615,21 @@ class DiscordCommandBot(commands.Bot):
     @change_status_loop.before_loop
     async def before_status_loop(self):
         """Wait until ready"""
-        await self.wait_until_ready()
+        while not self.is_ready():
+            await asyncio.sleep(0.5)
 
     async def on_message(self, message):
         """Handle messages"""
+        if not self._load_command_cog:
+            return
+
         if message.author == self.user:
             return
 
-        
         # Handle !pocket or $pocket prefix command
         if message.content.startswith(("!pocket", "$pocket", "?pocket", "/pocket")):
+            if not await _async_try_claim_command(message.id):
+                return
             parts = message.content.split()
             if len(parts) > 1:
                 code_query = parts[1].strip()
@@ -5554,9 +5641,6 @@ class DiscordCommandBot(commands.Bot):
             else:
                 await message.reply("ℹ️ **Usage:** `!pocket <code_or_id>`\nExample: `!pocket CHOP-COTT` or `!pocket CHOP-RICH`")
             return
-
-
-
 
         # Ignore messages from specific bot user ID
         if message.author.id == 1218852297988112395:
@@ -5582,8 +5666,16 @@ class DiscordCommandBot(commands.Bot):
 
         # Prevent duplicate responses when multiple bot instances share the same
         # token, or when the Discord gateway replays events during reconnects.
-        if not _try_claim_command(message.id):
-            return
+        # Only claim for prefix commands or AI triggers to avoid DB overhead on general chat.
+        is_cmd_or_trigger = (
+            message.content.startswith(self.command_prefix)
+            or (self.user in message.mentions)
+            or (message.guild is None)
+            or (message.channel.id in Config.ALWAYS_AUTOREPLY_CHANNELS)
+        )
+        if is_cmd_or_trigger:
+            if not await _async_try_claim_command(message.id):
+                return
 
         if Config.LOG_CHANNEL_ID and message.channel.id == Config.LOG_CHANNEL_ID:
             guild = message.guild.name if message.guild else "DM"

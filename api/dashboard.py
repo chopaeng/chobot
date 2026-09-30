@@ -598,11 +598,15 @@ def init_dashboard_db():
             pass
 
         conn.commit()
-        conn.close()
-
         logger.info("Dashboard DB initialised with pocket bundles, order queue, and favorite islands")
     except Exception as exc:
         logger.warning("Could not initialise dashboard DB: %s", exc)
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1192,76 +1196,76 @@ def _recent_incident_payload(limit: int = 25) -> dict:
             "ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
+
+        events = []
+        for row in unknown:
+            kind = "no_island_access" if row["has_island_access"] == 0 else "unknown_traveler"
+            events.append(_incident_event(
+                kind,
+                f"{row['ign']} visited {row['destination']}",
+                row["timestamp"],
+                row["user_id"],
+                dict(row),
+            ))
+        for row in warnings:
+            action = (row["action_type"] or "WARN").lower()
+            kind = "investigation" if action == "note" else "active_warning"
+            events.append(_incident_event(
+                kind,
+                f"{row['action_type']} for {row['ign'] or row['user_id'] or 'unknown user'}",
+                row["timestamp"],
+                row["user_id"],
+                dict(row),
+            ))
+        for row in dodo_reveals:
+            events.append(_incident_event(
+                "dodo_reveal",
+                f"Dodo revealed for {row['island_clean']}",
+                row["created_at"],
+                row["user_id"],
+                dict(row),
+            ))
+        for row in queue:
+            events.append(_incident_event(
+                "dodo_queue",
+                f"{row['username'] or row['user_id']} is queued for {row['island_name']}",
+                row["created_at"],
+                row["user_id"],
+                dict(row),
+            ))
+        actionable_identity_events = []
+        suppressed_identity_events = []
+        for row in identity_events:
+            cleared, authorized_at = _identity_event_cleared_by_authorization(db, row)
+            payload = dict(row)
+            payload["cleared_by_authorization"] = cleared
+            payload["cleared_authorized_at"] = authorized_at
+            if cleared:
+                suppressed_identity_events.append(payload)
+                continue
+            actionable_identity_events.append(payload)
+            events.append(_incident_event(
+                "recent_nickname_change",
+                f"Identity event for {row['user_id']}",
+                row["created_at"],
+                row["user_id"],
+                payload,
+            ))
+        for row in repeat_offenders:
+            events.append(_incident_event(
+                "repeat_offender",
+                f"{row['user_id']} has {row['warning_count']} recent actions",
+                row["last_warning_at"],
+                row["user_id"],
+                dict(row),
+            ))
+
+        source_pairs = [(event["kind"], event["source_id"]) for event in events]
+        workflow_map = _load_incident_workflow_map(db, source_pairs)
     except Exception as exc:
-        db.close()
         return {"ok": False, "error": str(exc)}
-
-    events = []
-    for row in unknown:
-        kind = "no_island_access" if row["has_island_access"] == 0 else "unknown_traveler"
-        events.append(_incident_event(
-            kind,
-            f"{row['ign']} visited {row['destination']}",
-            row["timestamp"],
-            row["user_id"],
-            dict(row),
-        ))
-    for row in warnings:
-        action = (row["action_type"] or "WARN").lower()
-        kind = "investigation" if action == "note" else "active_warning"
-        events.append(_incident_event(
-            kind,
-            f"{row['action_type']} for {row['ign'] or row['user_id'] or 'unknown user'}",
-            row["timestamp"],
-            row["user_id"],
-            dict(row),
-        ))
-    for row in dodo_reveals:
-        events.append(_incident_event(
-            "dodo_reveal",
-            f"Dodo revealed for {row['island_clean']}",
-            row["created_at"],
-            row["user_id"],
-            dict(row),
-        ))
-    for row in queue:
-        events.append(_incident_event(
-            "dodo_queue",
-            f"{row['username'] or row['user_id']} is queued for {row['island_name']}",
-            row["created_at"],
-            row["user_id"],
-            dict(row),
-        ))
-    actionable_identity_events = []
-    suppressed_identity_events = []
-    for row in identity_events:
-        cleared, authorized_at = _identity_event_cleared_by_authorization(db, row)
-        payload = dict(row)
-        payload["cleared_by_authorization"] = cleared
-        payload["cleared_authorized_at"] = authorized_at
-        if cleared:
-            suppressed_identity_events.append(payload)
-            continue
-        actionable_identity_events.append(payload)
-        events.append(_incident_event(
-            "recent_nickname_change",
-            f"Identity event for {row['user_id']}",
-            row["created_at"],
-            row["user_id"],
-            payload,
-        ))
-    for row in repeat_offenders:
-        events.append(_incident_event(
-            "repeat_offender",
-            f"{row['user_id']} has {row['warning_count']} recent actions",
-            row["last_warning_at"],
-            row["user_id"],
-            dict(row),
-        ))
-
-    source_pairs = [(event["kind"], event["source_id"]) for event in events]
-    workflow_map = _load_incident_workflow_map(db, source_pairs)
-    db.close()
+    finally:
+        db.close()
 
     for event in events:
         workflow = workflow_map.get((event["kind"], event["source_id"]))

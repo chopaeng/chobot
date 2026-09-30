@@ -33,13 +33,6 @@ from utils.database import connect_db
 from utils.acnh_catalog import ACNHCatalog, CatalogItem, CatalogVillager, generate_full_item_hex
 from utils.sysbot_api import SysBotClient, parse_order_input, _INVALID_DODO_CODES
 
-# ============================================================================
-# LOGGING SETUP
-# ============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-)
 logger = logging.getLogger("Chorder")
 
 # ============================================================================
@@ -1858,7 +1851,8 @@ class ChorderCog(commands.Cog, name="Chorder"):
 
     @stale_cart_task.before_loop
     async def before_stale_cart_task(self):
-        await self.bot.wait_until_ready()
+        while not self.bot.is_ready():
+            await asyncio.sleep(0.5)
 
     @tasks.loop(seconds=12)
     async def order_dm_notifier_task(self):
@@ -2026,7 +2020,8 @@ class ChorderCog(commands.Cog, name="Chorder"):
 
     @order_dm_notifier_task.before_loop
     async def before_order_dm_notifier_task(self):
-        await self.bot.wait_until_ready()
+        while not self.bot.is_ready():
+            await asyncio.sleep(0.5)
 
     # ── Slash Command: /catalog ─────────────────────────────────────────────
 
@@ -2193,6 +2188,10 @@ class ChorderBot(commands.Bot):
 
 def run_standalone():
     """Entry point for standalone execution."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    )
     token = Config.DISCORD_TOKEN or os.getenv("DISCORD_TOKEN")
     if not token:
         logger.error("[Chorder] DISCORD_TOKEN is not set in .env! Cannot start bot.")

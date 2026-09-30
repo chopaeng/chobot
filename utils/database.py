@@ -112,7 +112,7 @@ class Connection:
 
         sql, params = _adapt_sql(sql, params or (), self._dialect)
         
-        retries = 5
+        retries = 3
         while True:
             try:
                 cur = self._conn.cursor()
@@ -122,10 +122,14 @@ class Connection:
             except Exception as e:
                 err_str = str(e).lower()
                 if "database is locked" in err_str or "operationalerror" in err_str:
+                    try:
+                        self._conn.rollback()
+                    except Exception:
+                        pass
                     retries -= 1
                     if retries > 0:
                         import time
-                        time.sleep(1.0)
+                        time.sleep(0.15)
                         continue
                 raise
 
@@ -136,6 +140,10 @@ class Connection:
         self._conn.rollback()
 
     def close(self):
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
         self._conn.close()
 
 
@@ -246,6 +254,8 @@ def get_engine():
         "future": True,
     }
     if get_backend() == "sqlite":
+        from sqlalchemy.pool import NullPool
+        kwargs["poolclass"] = NullPool
         kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
     engine = create_engine(get_database_url(), **kwargs)
     if get_backend() == "sqlite":
@@ -260,6 +270,7 @@ def _configure_sqlite_connection(dbapi_conn, _connection_record) -> None:
         cur.execute("PRAGMA journal_mode = WAL")
         cur.execute("PRAGMA synchronous = NORMAL")
         cur.close()
+        dbapi_conn.commit()
     except Exception:
         pass
 

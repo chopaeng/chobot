@@ -87,6 +87,7 @@ logging.basicConfig(
     level=_log_level,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     handlers=_log_handlers,
+    force=True,
 )
 
 # Enable configured log level on all bot-specific modules
@@ -135,18 +136,68 @@ PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chobot.pid"
 _SIGTERM_GRACE_SECONDS = 2
 
 
-def acquire_pid_lock() -> None:
+def _is_chobot_process(pid: int) -> bool:
+    """Check if process with given PID exists and is a python process."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            exit_code = ctypes.c_ulong()
+            success = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            ctypes.windll.kernel32.CloseHandle(handle)
+            if success and exit_code.value == STILL_ACTIVE:
+                try:
+                    import subprocess
+                    out = subprocess.check_output(
+                        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                        text=True,
+                        timeout=2,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    return "python" in out.lower()
+                except Exception:
+                    return True
+            return False
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
+
+_CURRENT_PID_FILE = PID_FILE
+
+
+def get_pid_file(services: set[str] | None = None) -> str:
+    if not services or services == {"all"}:
+        return PID_FILE
+    tag = "_".join(sorted(s.replace("-", "_") for s in services))
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), f"chobot_{tag}.pid")
+
+
+def acquire_pid_lock(services: set[str] | None = None) -> None:
     """Write the current PID to the lock file, killing any prior instance first."""
+    global _CURRENT_PID_FILE
+    _CURRENT_PID_FILE = get_pid_file(services)
     current_pid = os.getpid()
 
-    if os.path.exists(PID_FILE):
+    if os.path.exists(_CURRENT_PID_FILE):
         try:
-            with open(PID_FILE, "r") as f:
+            with open(_CURRENT_PID_FILE, "r") as f:
                 old_pid = int(f.read().strip())
         except (ValueError, OSError):
             old_pid = None
 
-        if old_pid and old_pid != current_pid:
+        if old_pid and old_pid != current_pid and _is_chobot_process(old_pid):
             try:
                 os.kill(old_pid, signal.SIGTERM)
                 logger.info(f"[MAIN] Sent SIGTERM to previous instance (PID {old_pid}).")
@@ -158,22 +209,23 @@ def acquire_pid_lock() -> None:
                 logger.warning(f"[MAIN] Could not terminate previous instance: {exc}")
 
     try:
-        with open(PID_FILE, "w") as f:
+        with open(_CURRENT_PID_FILE, "w") as f:
             f.write(str(current_pid))
-        logger.info(f"[MAIN] PID lock acquired (PID {current_pid} → {PID_FILE}).")
+        logger.info(f"[MAIN] PID lock acquired (PID {current_pid} → {_CURRENT_PID_FILE}).")
     except OSError as exc:
         logger.warning(f"[MAIN] Could not write PID file: {exc}")
 
 
 def release_pid_lock() -> None:
     """Remove the PID lock file when shutting down cleanly."""
+    global _CURRENT_PID_FILE
     try:
-        if os.path.exists(PID_FILE):
-            with open(PID_FILE, "r") as f:
+        if os.path.exists(_CURRENT_PID_FILE):
+            with open(_CURRENT_PID_FILE, "r") as f:
                 stored_pid = int(f.read().strip())
             # Only remove the file if it still refers to *this* process.
             if stored_pid == os.getpid():
-                os.remove(PID_FILE)
+                os.remove(_CURRENT_PID_FILE)
                 logger.info("[MAIN] PID lock released.")
     except (OSError, ValueError):
         pass
@@ -257,18 +309,26 @@ def expand_services(requested: Set[str]) -> dict:
 # THREAD RUNNERS
 # ============================================================================
 def run_flask(data_manager: DataManager):
-    """Run Flask API server in a thread."""
-    try:
-        logger.info("[FLASK] Starting Flask API...")
-        record_service_status("flask", mode="api", status="starting")
-        set_data_manager(data_manager)
-        record_service_status("flask", mode="api", status="running")
-        run_flask_app(host="0.0.0.0", port=8100)
-    except Exception as e:
-        logger.error(f"[FLASK] Critical error: {e}")
-        logger.error(traceback.format_exc())
-        record_service_status("flask", mode="api", status="error", error=str(e))
-        STOP_EVENT.set()
+    """Run Flask API server in a thread with auto-restart on error."""
+    reconnect_delay = 3
+    while not STOP_EVENT.is_set():
+        try:
+            logger.info("[FLASK] Starting Flask API...")
+            record_service_status("flask", mode="api", status="starting")
+            set_data_manager(data_manager)
+            record_service_status("flask", mode="api", status="running")
+            run_flask_app(host="0.0.0.0", port=8100)
+            if STOP_EVENT.is_set():
+                break
+        except Exception as e:
+            if STOP_EVENT.is_set():
+                break
+            logger.error(f"[FLASK] Critical error in Flask API: {e}")
+            logger.error(traceback.format_exc())
+            record_service_status("flask", mode="api", status="error", error=str(e))
+            logger.info(f"[FLASK] Re-attempting Flask server in {reconnect_delay}s...")
+            time.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30)
 
 
 async def _safe_close_twitch_bot(twitch_bot: TwitchBot) -> None:
@@ -514,7 +574,7 @@ def main():
     logger.info("=" * 70)
 
     # ---- Single-instance lock (kill prior instance if still alive) ---------
-    acquire_pid_lock()
+    acquire_pid_lock(services)
 
     # ---- Validate config ---------------------------------------------------
     try:

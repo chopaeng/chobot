@@ -1416,6 +1416,7 @@ class FlightLoggerCog(commands.Cog):
         self._pending_alerts: dict[tuple[str, str], tuple[int, int]] = {}
         self._creating_alerts: set[tuple[str, str]] = set()
         self._pending_dodo_requests: dict[int, dict] = {}
+        self._chunk_lock = asyncio.Lock()
 
     def _prune_stale_caches(self):
         """Prune in-memory alert and dodo request caches to prevent unbounded growth over days."""
@@ -2262,9 +2263,8 @@ class FlightLoggerCog(commands.Cog):
 
     async def _safe_wait_until_ready(self):
         """Wait until bot cache and connection are fully initialized without raising RuntimeError."""
-        while getattr(self.bot, "_ready", None) is None or self.bot._ready is discord.utils.MISSING:
+        while not self.bot.is_ready():
             await asyncio.sleep(0.5)
-        await self.bot.wait_until_ready()
 
     def cog_unload(self):
         self.fetch_islands_task.cancel()
@@ -2405,6 +2405,7 @@ class FlightLoggerCog(commands.Cog):
             Config.ISLAND_BOT_ROLE_ID
         }
 
+        db_updates = []
         # 1. Collect subscription roles from each Channel overwrite
         for channel in category.channels:
             if channel.id == Config.FLIGHT_LISTEN_CHANNEL_ID:
@@ -2430,22 +2431,25 @@ class FlightLoggerCog(commands.Cog):
             # Sync with the 'islands' table used by the Web API
             island_clean = re.sub(r'^\d+', '', chan_clean)
             if island_clean:
-                try:
-                    # Note: Using a one-off connection here for simplicity in the task loop
-                    async with connect_async_db() as db:
-                        await db.execute(
-                            "UPDATE islands SET required_roles = ?, channel_id = ? WHERE UPPER(name) = ?",
-                            (json.dumps(channel_req_roles), str(channel.id), island_clean.upper())
-                        )
-                        await db.commit()
-                except Exception as e:
-                    logger.error(f"[FLIGHT] Failed to sync island {island_clean} to DB: {e}", exc_info=True)
+                db_updates.append((json.dumps(channel_req_roles), str(channel.id), island_clean.upper()))
 
             # Also map without leading digits for canonical name lookups
             # e.g. "01alapaap" -> "alapaap"
             island_clean = re.sub(r'^\d+', '', chan_clean)
             if island_clean and island_clean != chan_clean:
                 temp_map[island_clean] = channel.id
+
+        if db_updates:
+            try:
+                async with connect_async_db() as db:
+                    for roles_json, chan_id, isl_name in db_updates:
+                        await db.execute(
+                            "UPDATE islands SET required_roles = ?, channel_id = ? WHERE UPPER(name) = ?",
+                            (roles_json, chan_id, isl_name)
+                        )
+                    await db.commit()
+            except Exception as e:
+                logger.error(f"[FLIGHT] Failed to batch sync islands to DB: {e}", exc_info=True)
 
         self.island_map = temp_map
         self.all_sub_roles = sub_roles
@@ -2733,10 +2737,12 @@ class FlightLoggerCog(commands.Cog):
         try:
             target_guild = guild or self.bot.get_guild(Config.GUILD_ID)
             if target_guild and not target_guild.chunked:
-                try:
-                    await target_guild.chunk()
-                except Exception as chunk_err:
-                    logger.warning(f"[FLIGHT] Guild chunking failed/timed out: {chunk_err}")
+                async with self._chunk_lock:
+                    if not target_guild.chunked:
+                        try:
+                            await target_guild.chunk()
+                        except Exception as chunk_err:
+                            logger.warning(f"[FLIGHT] Guild chunking failed/timed out: {chunk_err}")
             found = await asyncio.to_thread(
                 self.find_matching_members, target_guild, ign_norm, isl_norm
             )
