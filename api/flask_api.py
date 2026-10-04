@@ -4999,6 +4999,109 @@ def api_search_island_map(island_name: str):
     return jsonify({"ok": True, **result})
 
 
+@app.route("/api/listing/", methods=["GET"])
+@app.route("/api/listing/<path:subpath>", methods=["GET"])
+def api_directory_listing(subpath=""):
+    """
+    List directory contents starting from C:/.
+
+    Query params:
+      - (none) — list C:/ root or the given subpath
+
+    Access is restricted to admin or mod users.
+    """
+    user = _current_auth_user()
+    if not user or (not user.get("is_admin") and not _is_mod(user)):
+        return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+    # Build the resolved path, always rooted at C:/
+    base_root = "C:\\"
+    if subpath:
+        # Normalise and prevent traversal outside C:/
+        requested = os.path.normpath(os.path.join(base_root, subpath.replace("/", os.sep)))
+        if not requested.startswith(base_root):
+            return jsonify({"ok": False, "error": "Path traversal not allowed"}), 400
+        target = requested
+    else:
+        target = base_root
+
+    if not os.path.exists(target):
+        return jsonify({"ok": False, "error": "Path not found"}), 404
+
+    if not os.path.isdir(target):
+        return jsonify({"ok": False, "error": "Path is not a directory"}), 400
+
+    entries = []
+    try:
+        for entry in sorted(os.scandir(target), key=lambda e: (not e.is_dir(), e.name.lower())):
+            try:
+                stat = entry.stat()
+                entries.append({
+                    "name": entry.name,
+                    "type": "directory" if entry.is_dir() else "file",
+                    "size": stat.st_size if entry.is_file() else None,
+                    "modified": int(stat.st_mtime),
+                })
+            except (PermissionError, OSError):
+                entries.append({
+                    "name": entry.name,
+                    "type": "directory" if entry.is_dir() else "file",
+                    "size": None,
+                    "modified": None,
+                    "error": "access_denied",
+                })
+    except PermissionError:
+        return jsonify({"ok": False, "error": "Permission denied"}), 403
+
+    return jsonify({
+        "ok": True,
+        "path": target.replace("\\", "/"),
+        "entries": entries,
+        "count": len(entries),
+    })
+
+
+@app.route("/api/listing/download/<path:subpath>", methods=["GET"])
+def api_directory_download(subpath):
+    """
+    Download a file from the server filesystem, rooted at C:/.
+
+    Path params:
+      - subpath — relative path from C:/ to the file (e.g. Users/bitress/Desktop/file.txt)
+
+    Access is restricted to admin or mod users.
+    """
+    from flask import send_file
+
+    user = _current_auth_user()
+    if not user or (not user.get("is_admin") and not _is_mod(user)):
+        return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+    base_root = "C:\\"
+    subpath_clean = re.sub(r'^[A-Za-z]:[/\\]?', '', subpath).replace("/", os.sep)
+    requested = os.path.normpath(os.path.join(base_root, subpath_clean))
+
+    if not requested.startswith(base_root):
+        return jsonify({"ok": False, "error": "Path traversal not allowed"}), 400
+
+    if not os.path.exists(requested):
+        return jsonify({"ok": False, "error": "Path not found"}), 404
+
+    if not os.path.isfile(requested):
+        return jsonify({"ok": False, "error": "Path is not a file"}), 400
+
+    try:
+        return send_file(
+            requested,
+            as_attachment=True,
+            download_name=os.path.basename(requested),
+        )
+    except PermissionError:
+        return jsonify({"ok": False, "error": "Permission denied"}), 403
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/islands/maps", methods=["GET"])
 def api_list_island_maps():
     """

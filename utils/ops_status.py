@@ -20,6 +20,7 @@ MAINTENANCE_KEYS = {
     "maintenance_disable_dodo_reveals": "false",
     "maintenance_disable_refresh": "false",
     "maintenance_disable_commands": "false",
+    "maintenance_disable_ads": "false",
     "maintenance_islands": "{}",
     "maintenance_message": "",
 }
@@ -119,7 +120,7 @@ def get_maintenance_settings() -> dict[str, Any]:
         try:
             _ensure_settings_table(db)
             rows = db.execute(
-                "SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?, ?, ?)",
+                "SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?, ?, ?, ?)",
                 tuple(MAINTENANCE_KEYS),
             ).fetchall()
             for row in rows:
@@ -138,6 +139,7 @@ def get_maintenance_settings() -> dict[str, Any]:
         "disable_dodo_reveals": _bool_from_setting(values["maintenance_disable_dodo_reveals"]),
         "disable_refresh": _bool_from_setting(values["maintenance_disable_refresh"]),
         "disable_commands": _bool_from_setting(values["maintenance_disable_commands"]),
+        "disable_ads": _bool_from_setting(values["maintenance_disable_ads"]),
         "islands": islands if isinstance(islands, dict) else {},
         "message": str(values["maintenance_message"] or ""),
     }
@@ -151,6 +153,7 @@ def update_maintenance_settings(payload: dict[str, Any]) -> dict[str, Any]:
         else "false",
         "maintenance_disable_refresh": "true" if _bool_from_setting(payload.get("disable_refresh")) else "false",
         "maintenance_disable_commands": "true" if _bool_from_setting(payload.get("disable_commands")) else "false",
+        "maintenance_disable_ads": "true" if _bool_from_setting(payload.get("disable_ads")) else "false",
         "maintenance_islands": json.dumps(payload.get("islands") if isinstance(payload.get("islands"), dict) else {}),
         "maintenance_message": str(payload.get("message") or "").strip()[:500],
     }
