@@ -63,11 +63,15 @@ def is_mod(roles: list[str] | set[str] | tuple[str, ...]) -> bool:
 
 
 def has_island_access(roles: list[str], required_roles: list[str], is_mod_user: bool = False) -> bool:
-    """Return whether a viewer can access an island."""
-    if not required_roles:
-        return True
+    """Return whether a viewer can access an island.
+
+    An empty ``required_roles`` list means no roles are configured, so access
+    is denied for regular users (mods/admins are always granted access).
+    """
     if is_mod_user or is_mod(roles):
         return True
+    if not required_roles:
+        return False  # no roles configured → deny non-mods
     return bool(set(required_roles) & {str(role_id) for role_id in roles})
 
 
@@ -282,7 +286,10 @@ def resolved_island_required_roles(
                     force_refresh=force_refresh,
                 )
                 resolved_channel_id = fetched_channel_id or found_channel_id
-        if dynamic_roles is not None:
+        # Only trust Discord overwrites when they contain at least one role.
+        # An empty list means the channel has no explicit role grants, so fall
+        # through to the DB/configured-subscription-role fallback below.
+        if dynamic_roles:
             return IslandAccessInfo(dynamic_roles, resolved_channel_id, "discord_channel")
 
     return IslandAccessInfo(
