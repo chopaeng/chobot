@@ -1059,8 +1059,11 @@ def _build_island_response(
         island_type,
         db_island.get("channel_id"),
     )
-    is_member_locked = _is_member_island(island_cat, island_type) and not required_roles and not viewer_is_mod
-    viewer_has_access = False if is_member_locked else _has_island_access(
+    # For member/VIP islands, fall back to configured subscription roles so
+    # viewer_has_access is never True for non-subs when required_roles is empty.
+    if _is_member_island(island_cat, island_type) and not required_roles:
+        required_roles = _effective_island_required_roles(island_cat, required_roles, island_type)
+    viewer_has_access = _has_island_access(
         viewer_roles,
         required_roles,
         viewer_is_mod,
@@ -2143,12 +2146,7 @@ def get_islands():
     return jsonify({
         "meta": {
             "timestamp": datetime.now().isoformat(),
-            "cache_ttl_seconds": _FILE_CACHE_TTL,
-            "note": (
-                f"Dodo codes and visitor counts are read directly from files written by "
-                f"the C# island bot. Each file read is cached for up to "
-                f"{_FILE_CACHE_TTL} seconds, so data is near-real-time."
-            ),
+            "cache_ttl_seconds": _FILE_CACHE_TTL
         },
         "data": results,
     })
