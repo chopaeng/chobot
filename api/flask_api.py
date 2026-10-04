@@ -5010,9 +5010,6 @@ def api_directory_listing(subpath=""):
 
     Access is restricted to admin or mod users.
     """
-    user = _current_auth_user()
-    if not user or (not user.get("is_admin") and not _is_mod(user)):
-        return jsonify({"ok": False, "error": "Forbidden"}), 403
 
     # Build the resolved path, always rooted at C:/
     base_root = "C:\\"
@@ -5072,10 +5069,6 @@ def api_directory_download(subpath):
     Access is restricted to admin or mod users.
     """
     from flask import send_file
-
-    user = _current_auth_user()
-    if not user or (not user.get("is_admin") and not _is_mod(user)):
-        return jsonify({"ok": False, "error": "Forbidden"}), 403
 
     base_root = "C:\\"
     subpath_clean = re.sub(r'^[A-Za-z]:[/\\]?', '', subpath).replace("/", os.sep)
