@@ -1070,10 +1070,7 @@ def _build_island_response(
     visitors, visitor_list = _parse_visitor_list(get_file_content(entry.path, "Visitors.txt"))
 
     # Determine live status and dodo_code from filesystem
-    if _is_member_island(island_cat, island_type) and not viewer_has_access:
-        status = "SUB ONLY"
-        dodo_code = None  # Do not expose dodo code for subscriber-only islands
-    elif raw_dodo is None:
+    if raw_dodo is None:
         status = "OFFLINE"
         dodo_code = None
     elif (raw_dodo or "").strip().upper() in ["00000", "-----", "", "GETTIN'"]:
@@ -1083,15 +1080,27 @@ def _build_island_response(
         status = "ONLINE"
         dodo_code = raw_dodo
 
-    # Keep member/order codes behind their controlled channels/endpoints.
-    if _is_member_island(island_cat, island_type) or island_type == "Order" or island_cat == "order":
-        dodo_code = None
+    # Access gating:
+    #   Free islands  (DIR_FREE)  → everyone sees the dodo code
+    #   Sub islands   (DIR_VIP)   → subs, mods, admins only
+    #   Order islands (DIR_ORDER) → mods and admins only
+    is_free_island   = island_type == "Free"
+    is_sub_island    = _is_member_island(island_cat, island_type)
+    is_order_island  = island_type == "Order" or island_cat == "order"
 
-    # When the Discord bot is not confirmed online, hide live data to avoid stale values (unless refreshing)
+    if is_sub_island and not viewer_has_access:
+        status    = "SUB ONLY"
+        dodo_code = None  # subscriber-only — hide from non-members
+    elif is_order_island:
+        dodo_code = None  # order dodo is bot-only, never exposed via API
+
+    # When the Discord bot is not confirmed online, zero visitors to avoid stale counts.
+    # Dodo codes are still shown to authorised viewers — the file is ground truth.
     if not discord_bot_online and status != "REFRESHING":
         visitors = 0
         visitor_list = []
-        dodo_code = None
+        if not (is_free_island or viewer_has_access or viewer_is_mod):
+            dodo_code = None
 
     return {
         "id":                db_island.get("id", name.lower()),
@@ -4999,100 +5008,100 @@ def api_search_island_map(island_name: str):
     return jsonify({"ok": True, **result})
 
 
-@app.route("/api/listing/", methods=["GET"])
-@app.route("/api/listing/<path:subpath>", methods=["GET"])
-def api_directory_listing(subpath=""):
-    """
-    List directory contents starting from C:/.
+# @app.route("/api/listing/", methods=["GET"])
+# @app.route("/api/listing/<path:subpath>", methods=["GET"])
+# def api_directory_listing(subpath=""):
+#     """
+#     List directory contents starting from C:/.
 
-    Query params:
-      - (none) — list C:/ root or the given subpath
+#     Query params:
+#       - (none) — list C:/ root or the given subpath
 
-    Access is restricted to admin or mod users.
-    """
+#     Access is restricted to admin or mod users.
+#     """
 
-    # Build the resolved path, always rooted at C:/
-    base_root = "C:\\"
-    if subpath:
-        # Normalise and prevent traversal outside C:/
-        requested = os.path.normpath(os.path.join(base_root, subpath.replace("/", os.sep)))
-        if not requested.startswith(base_root):
-            return jsonify({"ok": False, "error": "Path traversal not allowed"}), 400
-        target = requested
-    else:
-        target = base_root
+#     # Build the resolved path, always rooted at C:/
+#     base_root = "C:\\"
+#     if subpath:
+#         # Normalise and prevent traversal outside C:/
+#         requested = os.path.normpath(os.path.join(base_root, subpath.replace("/", os.sep)))
+#         if not requested.startswith(base_root):
+#             return jsonify({"ok": False, "error": "Path traversal not allowed"}), 400
+#         target = requested
+#     else:
+#         target = base_root
 
-    if not os.path.exists(target):
-        return jsonify({"ok": False, "error": "Path not found"}), 404
+#     if not os.path.exists(target):
+#         return jsonify({"ok": False, "error": "Path not found"}), 404
 
-    if not os.path.isdir(target):
-        return jsonify({"ok": False, "error": "Path is not a directory"}), 400
+#     if not os.path.isdir(target):
+#         return jsonify({"ok": False, "error": "Path is not a directory"}), 400
 
-    entries = []
-    try:
-        for entry in sorted(os.scandir(target), key=lambda e: (not e.is_dir(), e.name.lower())):
-            try:
-                stat = entry.stat()
-                entries.append({
-                    "name": entry.name,
-                    "type": "directory" if entry.is_dir() else "file",
-                    "size": stat.st_size if entry.is_file() else None,
-                    "modified": int(stat.st_mtime),
-                })
-            except (PermissionError, OSError):
-                entries.append({
-                    "name": entry.name,
-                    "type": "directory" if entry.is_dir() else "file",
-                    "size": None,
-                    "modified": None,
-                    "error": "access_denied",
-                })
-    except PermissionError:
-        return jsonify({"ok": False, "error": "Permission denied"}), 403
+#     entries = []
+#     try:
+#         for entry in sorted(os.scandir(target), key=lambda e: (not e.is_dir(), e.name.lower())):
+#             try:
+#                 stat = entry.stat()
+#                 entries.append({
+#                     "name": entry.name,
+#                     "type": "directory" if entry.is_dir() else "file",
+#                     "size": stat.st_size if entry.is_file() else None,
+#                     "modified": int(stat.st_mtime),
+#                 })
+#             except (PermissionError, OSError):
+#                 entries.append({
+#                     "name": entry.name,
+#                     "type": "directory" if entry.is_dir() else "file",
+#                     "size": None,
+#                     "modified": None,
+#                     "error": "access_denied",
+#                 })
+#     except PermissionError:
+#         return jsonify({"ok": False, "error": "Permission denied"}), 403
 
-    return jsonify({
-        "ok": True,
-        "path": target.replace("\\", "/"),
-        "entries": entries,
-        "count": len(entries),
-    })
+#     return jsonify({
+#         "ok": True,
+#         "path": target.replace("\\", "/"),
+#         "entries": entries,
+#         "count": len(entries),
+#     })
 
 
-@app.route("/api/listing/download/<path:subpath>", methods=["GET"])
-def api_directory_download(subpath):
-    """
-    Download a file from the server filesystem, rooted at C:/.
+# @app.route("/api/listing/download/<path:subpath>", methods=["GET"])
+# def api_directory_download(subpath):
+#     """
+#     Download a file from the server filesystem, rooted at C:/.
 
-    Path params:
-      - subpath — relative path from C:/ to the file (e.g. Users/bitress/Desktop/file.txt)
+#     Path params:
+#       - subpath — relative path from C:/ to the file (e.g. Users/bitress/Desktop/file.txt)
 
-    Access is restricted to admin or mod users.
-    """
-    from flask import send_file
+#     Access is restricted to admin or mod users.
+#     """
+#     from flask import send_file
 
-    base_root = "C:\\"
-    subpath_clean = re.sub(r'^[A-Za-z]:[/\\]?', '', subpath).replace("/", os.sep)
-    requested = os.path.normpath(os.path.join(base_root, subpath_clean))
+#     base_root = "C:\\"
+#     subpath_clean = re.sub(r'^[A-Za-z]:[/\\]?', '', subpath).replace("/", os.sep)
+#     requested = os.path.normpath(os.path.join(base_root, subpath_clean))
 
-    if not requested.startswith(base_root):
-        return jsonify({"ok": False, "error": "Path traversal not allowed"}), 400
+#     if not requested.startswith(base_root):
+#         return jsonify({"ok": False, "error": "Path traversal not allowed"}), 400
 
-    if not os.path.exists(requested):
-        return jsonify({"ok": False, "error": "Path not found"}), 404
+#     if not os.path.exists(requested):
+#         return jsonify({"ok": False, "error": "Path not found"}), 404
 
-    if not os.path.isfile(requested):
-        return jsonify({"ok": False, "error": "Path is not a file"}), 400
+#     if not os.path.isfile(requested):
+#         return jsonify({"ok": False, "error": "Path is not a file"}), 400
 
-    try:
-        return send_file(
-            requested,
-            as_attachment=True,
-            download_name=os.path.basename(requested),
-        )
-    except PermissionError:
-        return jsonify({"ok": False, "error": "Permission denied"}), 403
-    except OSError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+#     try:
+#         return send_file(
+#             requested,
+#             as_attachment=True,
+#             download_name=os.path.basename(requested),
+#         )
+#     except PermissionError:
+#         return jsonify({"ok": False, "error": "Permission denied"}), 403
+#     except OSError as e:
+#         return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/islands/maps", methods=["GET"])
