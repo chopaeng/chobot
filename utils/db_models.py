@@ -426,3 +426,69 @@ class WebsiteLoginEvent(Base):
     __table_args__ = (
         Index("ix_website_login_user_ts", "user_id", "logged_in_at"),
     )
+
+
+class UserCollectionItem(Base):
+    __tablename__ = "user_collection_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    item_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    __table_args__ = (
+        Index("ix_user_collection_uid_item", "user_id", "item_id", unique=True),
+    )
+
+
+class UserWishlistItem(Base):
+    __tablename__ = "user_wishlist_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    item_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    __table_args__ = (
+        Index("ix_user_wishlist_uid_item", "user_id", "item_id", unique=True),
+    )
+
+
+class UserPocketState(Base):
+    __tablename__ = "user_pocket_states"
+
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    order_items: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    drop_items: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    villager: Mapped[str | None] = mapped_column(String(255))
+    updated_at: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class UserCaughtCritter(Base):
+    __tablename__ = "user_caught_critters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    critter_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    hemisphere: Mapped[str] = mapped_column(String(16), nullable=False, default="north")
+    caught_at: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    __table_args__ = (
+        Index("ix_user_critters_uid_name_hemi", "user_id", "critter_name", "hemisphere", unique=True),
+    )
+
+
+class UserInAppNotification(Base):
+    __tablename__ = "user_in_app_notifications"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    type: Mapped[str] = mapped_column(String(32), nullable=False, default="info")
+    is_read: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+
+    __table_args__ = (
+        Index("ix_user_notifications_uid_ts", "user_id", "timestamp"),
+    )

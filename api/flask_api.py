@@ -5152,3 +5152,433 @@ def run_flask_app(host='0.0.0.0', port=8100):
                 )
                 raise
 
+
+# ============================================================================
+# USER COLLECTION, WISHLIST, POCKETS, CRITTERS, AND NOTIFICATIONS ENDPOINTS
+# ============================================================================
+
+@app.route("/api/user/collection", methods=["GET", "POST", "DELETE"])
+@app.route("/api/profile/collection", methods=["GET", "POST", "DELETE"])
+def api_user_collection():
+    """Get, update, or clear authenticated user item collection."""
+    auth_user = _current_auth_user()
+    if not auth_user:
+        return jsonify({"ok": False, "success": False, "error": "Authentication required"}), 401
+
+    user_id = str(auth_user.get("user_id") or auth_user.get("discord_id") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "success": False, "error": "User ID not found"}), 401
+
+    conn = get_db()
+    try:
+        if request.method == "GET":
+            rows = conn.execute(
+                "SELECT item_id FROM user_collection_items WHERE user_id = ? ORDER BY id ASC",
+                (user_id,)
+            ).fetchall()
+            collection = [r["item_id"] for r in rows if r["item_id"]]
+            return jsonify({
+                "ok": True,
+                "success": True,
+                "collection": collection,
+                "count": len(collection)
+            })
+
+        if request.method == "DELETE":
+            conn.execute("DELETE FROM user_collection_items WHERE user_id = ?", (user_id,))
+            conn.commit()
+            return jsonify({"ok": True, "success": True, "collection": [], "count": 0})
+
+        # POST
+        data = request.get_json(silent=True) or {}
+        now_iso = datetime.utcnow().isoformat()
+
+        # Batch replacement
+        if "collection" in data or isinstance(data, list):
+            items = data.get("collection") if isinstance(data, dict) else data
+            if isinstance(items, list):
+                conn.execute("DELETE FROM user_collection_items WHERE user_id = ?", (user_id,))
+                for itm in items:
+                    clean_id = str(itm).strip()[:128]
+                    if clean_id:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO user_collection_items (user_id, item_id, created_at)
+                            VALUES (?, ?, ?)
+                        """, (user_id, clean_id, now_iso))
+                conn.commit()
+                return jsonify({"ok": True, "success": True, "count": len(items)})
+
+        # Single toggle / set
+        item_id = str(data.get("itemId") or data.get("item_id") or data.get("id") or "").strip()[:128]
+        if not item_id:
+            return jsonify({"ok": False, "error": "item_id is required"}), 400
+
+        is_collected = data.get("collected")
+        if is_collected is None:
+            is_collected = data.get("isCollected", True)
+        is_collected = bool(is_collected)
+
+        if is_collected:
+            conn.execute("""
+                INSERT OR IGNORE INTO user_collection_items (user_id, item_id, created_at)
+                VALUES (?, ?, ?)
+            """, (user_id, item_id, now_iso))
+        else:
+            conn.execute(
+                "DELETE FROM user_collection_items WHERE user_id = ? AND item_id = ?",
+                (user_id, item_id)
+            )
+        conn.commit()
+
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "itemId": item_id,
+            "collected": is_collected
+        })
+    except Exception as exc:
+        logger.warning("Error in user collection API: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/user/wishlist", methods=["GET", "POST", "DELETE"])
+@app.route("/api/profile/wishlist", methods=["GET", "POST", "DELETE"])
+@app.route("/api/user/item-favorites", methods=["GET", "POST", "DELETE"])
+def api_user_wishlist():
+    """Get, update, or clear authenticated user item wishlist / favorites."""
+    auth_user = _current_auth_user()
+    if not auth_user:
+        return jsonify({"ok": False, "success": False, "error": "Authentication required"}), 401
+
+    user_id = str(auth_user.get("user_id") or auth_user.get("discord_id") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "success": False, "error": "User ID not found"}), 401
+
+    conn = get_db()
+    try:
+        if request.method == "GET":
+            rows = conn.execute(
+                "SELECT item_id FROM user_wishlist_items WHERE user_id = ? ORDER BY id ASC",
+                (user_id,)
+            ).fetchall()
+            wishlist = [r["item_id"] for r in rows if r["item_id"]]
+            return jsonify({
+                "ok": True,
+                "success": True,
+                "wishlist": wishlist,
+                "favorites": wishlist,
+                "count": len(wishlist)
+            })
+
+        if request.method == "DELETE":
+            conn.execute("DELETE FROM user_wishlist_items WHERE user_id = ?", (user_id,))
+            conn.commit()
+            return jsonify({"ok": True, "success": True, "wishlist": [], "count": 0})
+
+        # POST
+        data = request.get_json(silent=True) or {}
+        now_iso = datetime.utcnow().isoformat()
+
+        # Batch replacement
+        if "wishlist" in data or "favorites" in data or isinstance(data, list):
+            items = data.get("wishlist") or data.get("favorites") if isinstance(data, dict) else data
+            if isinstance(items, list):
+                conn.execute("DELETE FROM user_wishlist_items WHERE user_id = ?", (user_id,))
+                for itm in items:
+                    clean_id = str(itm).strip()[:128]
+                    if clean_id:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO user_wishlist_items (user_id, item_id, created_at)
+                            VALUES (?, ?, ?)
+                        """, (user_id, clean_id, now_iso))
+                conn.commit()
+                return jsonify({"ok": True, "success": True, "count": len(items)})
+
+        # Single toggle / set
+        item_id = str(data.get("itemId") or data.get("item_id") or data.get("id") or "").strip()[:128]
+        if not item_id:
+            return jsonify({"ok": False, "error": "item_id is required"}), 400
+
+        is_fav = data.get("isFavorite")
+        if is_fav is None:
+            is_fav = data.get("is_favorite")
+        if is_fav is None:
+            is_fav = data.get("wishlist", True)
+        is_fav = bool(is_fav)
+
+        if is_fav:
+            conn.execute("""
+                INSERT OR IGNORE INTO user_wishlist_items (user_id, item_id, created_at)
+                VALUES (?, ?, ?)
+            """, (user_id, item_id, now_iso))
+        else:
+            conn.execute(
+                "DELETE FROM user_wishlist_items WHERE user_id = ? AND item_id = ?",
+                (user_id, item_id)
+            )
+        conn.commit()
+
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "itemId": item_id,
+            "isFavorite": is_fav
+        })
+    except Exception as exc:
+        logger.warning("Error in user wishlist API: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/user/pockets", methods=["GET", "POST"])
+@app.route("/api/profile/pockets", methods=["GET", "POST"])
+@app.route("/api/user/pocket-inventory", methods=["GET", "POST"])
+def api_user_pockets():
+    """Get or save authenticated user pocket inventory (order items & drop items)."""
+    auth_user = _current_auth_user()
+    if not auth_user:
+        return jsonify({"ok": False, "success": False, "error": "Authentication required"}), 401
+
+    user_id = str(auth_user.get("user_id") or auth_user.get("discord_id") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "success": False, "error": "User ID not found"}), 401
+
+    conn = get_db()
+    try:
+        if request.method == "GET":
+            row = conn.execute(
+                "SELECT order_items, drop_items, villager, updated_at FROM user_pocket_states WHERE user_id = ?",
+                (user_id,)
+            ).fetchone()
+            if not row:
+                return jsonify({
+                    "ok": True,
+                    "success": True,
+                    "orderItems": [],
+                    "dropItems": [],
+                    "villager": None
+                })
+            return jsonify({
+                "ok": True,
+                "success": True,
+                "orderItems": json.loads(row["order_items"] or "[]"),
+                "dropItems": json.loads(row["drop_items"] or "[]"),
+                "villager": row["villager"],
+                "updatedAt": row["updated_at"]
+            })
+
+        # POST: Save pocket state
+        data = request.get_json(silent=True) or {}
+        order_items_json = json.dumps(data.get("orderItems") or data.get("order_items") or [])
+        drop_items_json = json.dumps(data.get("dropItems") or data.get("drop_items") or [])
+        villager = data.get("villager")
+        villager_str = str(villager).strip()[:255] if villager else None
+        now_iso = datetime.utcnow().isoformat()
+
+        conn.execute("""
+            INSERT OR REPLACE INTO user_pocket_states (user_id, order_items, drop_items, villager, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, order_items_json, drop_items_json, villager_str, now_iso))
+        conn.commit()
+
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "updatedAt": now_iso
+        })
+    except Exception as exc:
+        logger.warning("Error in user pockets API: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/user/critters", methods=["GET", "POST"])
+@app.route("/api/profile/critters", methods=["GET", "POST"])
+def api_user_critters():
+    """Get or save authenticated user caught critters."""
+    auth_user = _current_auth_user()
+    if not auth_user:
+        return jsonify({"ok": False, "success": False, "error": "Authentication required"}), 401
+
+    user_id = str(auth_user.get("user_id") or auth_user.get("discord_id") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "success": False, "error": "User ID not found"}), 401
+
+    conn = get_db()
+    try:
+        hemisphere = (request.args.get("hemisphere") or "north").strip().lower()
+
+        if request.method == "GET":
+            rows = conn.execute(
+                "SELECT critter_name FROM user_caught_critters WHERE user_id = ? AND hemisphere = ?",
+                (user_id, hemisphere)
+            ).fetchall()
+            caught = [r["critter_name"] for r in rows if r["critter_name"]]
+            return jsonify({
+                "ok": True,
+                "success": True,
+                "hemisphere": hemisphere,
+                "caught": caught,
+                "count": len(caught)
+            })
+
+        # POST: Toggle or batch save
+        data = request.get_json(silent=True) or {}
+        hemi = str(data.get("hemisphere") or hemisphere).strip().lower()
+        now_iso = datetime.utcnow().isoformat()
+
+        # Batch replacement
+        if "caught" in data or isinstance(data, list):
+            items = data.get("caught") if isinstance(data, dict) else data
+            if isinstance(items, list):
+                conn.execute(
+                    "DELETE FROM user_caught_critters WHERE user_id = ? AND hemisphere = ?",
+                    (user_id, hemi)
+                )
+                for itm in items:
+                    clean_name = str(itm).strip()[:128]
+                    if clean_name:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO user_caught_critters (user_id, critter_name, hemisphere, caught_at)
+                            VALUES (?, ?, ?, ?)
+                        """, (user_id, clean_name, hemi, now_iso))
+                conn.commit()
+                return jsonify({"ok": True, "success": True, "hemisphere": hemi, "count": len(items)})
+
+        # Single toggle / set
+        name = str(data.get("name") or data.get("critter_name") or "").strip()[:128]
+        if not name:
+            return jsonify({"ok": False, "error": "name is required"}), 400
+
+        is_caught = data.get("caught")
+        if is_caught is None:
+            is_caught = data.get("isCaught", True)
+        is_caught = bool(is_caught)
+
+        if is_caught:
+            conn.execute("""
+                INSERT OR IGNORE INTO user_caught_critters (user_id, critter_name, hemisphere, caught_at)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, name, hemi, now_iso))
+        else:
+            conn.execute(
+                "DELETE FROM user_caught_critters WHERE user_id = ? AND critter_name = ? AND hemisphere = ?",
+                (user_id, name, hemi)
+            )
+        conn.commit()
+
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "name": name,
+            "caught": is_caught,
+            "hemisphere": hemi
+        })
+    except Exception as exc:
+        logger.warning("Error in user critters API: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/user/notifications", methods=["GET", "POST", "DELETE"])
+@app.route("/api/profile/notifications", methods=["GET", "POST", "DELETE"])
+def api_user_notifications():
+    """Get, create, or clear authenticated user in-app notifications."""
+    auth_user = _current_auth_user()
+    if not auth_user:
+        return jsonify({"ok": False, "success": False, "error": "Authentication required"}), 401
+
+    user_id = str(auth_user.get("user_id") or auth_user.get("discord_id") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "success": False, "error": "User ID not found"}), 401
+
+    conn = get_db()
+    try:
+        if request.method == "GET":
+            rows = conn.execute(
+                "SELECT id, title, body, type, is_read, timestamp FROM user_in_app_notifications WHERE user_id = ? ORDER BY timestamp DESC LIMIT 50",
+                (user_id,)
+            ).fetchall()
+            notifs = []
+            for r in rows:
+                notifs.append({
+                    "id": r["id"],
+                    "title": r["title"],
+                    "body": r["body"],
+                    "type": r["type"],
+                    "read": bool(r["is_read"]),
+                    "timestamp": r["timestamp"]
+                })
+            return jsonify({
+                "ok": True,
+                "success": True,
+                "notifications": notifs,
+                "unreadCount": sum(1 for n in notifs if not n["read"])
+            })
+
+        if request.method == "DELETE":
+            conn.execute("DELETE FROM user_in_app_notifications WHERE user_id = ?", (user_id,))
+            conn.commit()
+            return jsonify({"ok": True, "success": True, "notifications": []})
+
+        # POST: Push notification
+        data = request.get_json(silent=True) or {}
+        notif_id = str(data.get("id") or f"notif_{int(time.time()*1000)}_{_secrets.token_hex(4)}")
+        title = str(data.get("title") or "Notice").strip()[:255]
+        body = str(data.get("body") or "").strip()
+        ntype = str(data.get("type") or "info").strip()[:32]
+        ts = int(data.get("timestamp") or (time.time() * 1000))
+        is_read = 1 if bool(data.get("read") or data.get("is_read")) else 0
+
+        conn.execute("""
+            INSERT OR REPLACE INTO user_in_app_notifications (id, user_id, title, body, type, is_read, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (notif_id, user_id, title, body, ntype, is_read, ts))
+        conn.commit()
+
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "notification": {
+                "id": notif_id,
+                "title": title,
+                "body": body,
+                "type": ntype,
+                "read": bool(is_read),
+                "timestamp": ts
+            }
+        })
+    except Exception as exc:
+        logger.warning("Error in user notifications API: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/user/notifications/read", methods=["POST"])
+@app.route("/api/profile/notifications/read", methods=["POST"])
+def api_user_notifications_read():
+    """Mark all authenticated user notifications as read."""
+    auth_user = _current_auth_user()
+    if not auth_user:
+        return jsonify({"ok": False, "success": False, "error": "Authentication required"}), 401
+
+    user_id = str(auth_user.get("user_id") or auth_user.get("discord_id") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "success": False, "error": "User ID not found"}), 401
+
+    conn = get_db()
+    try:
+        conn.execute("UPDATE user_in_app_notifications SET is_read = 1 WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return jsonify({"ok": True, "success": True})
+    except Exception as exc:
+        logger.warning("Error marking notifications read: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        conn.close()
