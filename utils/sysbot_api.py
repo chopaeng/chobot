@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -202,7 +202,7 @@ class SysBotClient:
             self._offline_until = time.monotonic() + self._offline_cooldown
             return {"success": False, "error": str(exc)}, 500
 
-    def _post(self, path: str, payload: dict) -> Tuple[dict, int]:
+    def _post(self, path: str, payload: Any) -> Tuple[dict, int]:
         if not self.base_url:
             return {"success": False, "error": "SysBot API is not configured."}, 503
 
@@ -215,7 +215,41 @@ class SysBotClient:
             resp = self._get_session().post(
                 url,
                 headers=self._headers(),
-                json=payload,
+                json=payload if payload is not None else {},
+                timeout=(3.0, float(self.timeout)),
+            )
+            if resp.status_code in (502, 503, 504):
+                self._offline_until = time.monotonic() + self._offline_cooldown
+            else:
+                self._offline_until = 0.0
+            try:
+                return resp.json(), resp.status_code
+            except Exception:
+                return {"success": False, "error": f"HTTP {resp.status_code}: non-JSON response"}, resp.status_code
+        except (requests.exceptions.ConnectionError, urllib3.exceptions.HTTPError, OSError):
+            self._offline_until = time.monotonic() + self._offline_cooldown
+            return {"success": False, "error": "SysBot API is unreachable or offline."}, 503
+        except requests.exceptions.Timeout:
+            self._offline_until = time.monotonic() + self._offline_cooldown
+            return {"success": False, "error": "SysBot API request timed out."}, 504
+        except Exception as exc:
+            self._offline_until = time.monotonic() + self._offline_cooldown
+            return {"success": False, "error": str(exc)}, 500
+
+    def _delete(self, path: str, **params) -> Tuple[dict, int]:
+        if not self.base_url:
+            return {"success": False, "error": "SysBot API is not configured."}, 503
+
+        now = time.monotonic()
+        if now < self._offline_until:
+            return {"success": False, "error": "SysBot API is unreachable or offline."}, 503
+
+        url = f"{self.base_url}{path}"
+        try:
+            resp = self._get_session().delete(
+                url,
+                headers=self._headers(),
+                params={k: v for k, v in params.items() if v is not None},
                 timeout=(3.0, float(self.timeout)),
             )
             if resp.status_code in (502, 503, 504):
@@ -248,6 +282,10 @@ class SysBotClient:
                 "island_name": island_default,
                 "is_running": False,
                 "accepting_commands": False,
+                "is_connected": False,
+                "console_stage": "Offline",
+                "is_dodo_valid": False,
+                "is_refreshing_dodo": False,
                 "queue_count": 0,
             }
 
@@ -259,10 +297,20 @@ class SysBotClient:
             data.setdefault("island_name", island_default)
             data.setdefault("is_running", True)
             data.setdefault("accepting_commands", True)
+            data.setdefault("is_connected", True)
+            data.setdefault("console_stage", "Running")
+            dodo = data.get("dodo_code")
+            is_valid_dodo = bool(dodo and str(dodo).strip() not in _INVALID_DODO_CODES)
+            data.setdefault("is_dodo_valid", is_valid_dodo)
+            data.setdefault("is_refreshing_dodo", not is_valid_dodo)
             data.setdefault("queue_count", 0)
         else:
             data.setdefault("is_running", False)
             data.setdefault("accepting_commands", False)
+            data.setdefault("is_connected", False)
+            data.setdefault("console_stage", "Stopped")
+            data.setdefault("is_dodo_valid", False)
+            data.setdefault("is_refreshing_dodo", False)
             data.setdefault("island_name", island_default)
             data.setdefault("queue_count", 0)
 
@@ -555,3 +603,102 @@ class SysBotClient:
             return orders
 
         return await asyncio.to_thread(_query)
+
+    async def get_villagers(self) -> dict:
+        """
+        Fetch the list of villagers currently residing on the island from SysBot.
+        Calls GET /api/villagers.
+        """
+        data, code = await asyncio.to_thread(self._get, "/api/villagers")
+        if not isinstance(data, dict):
+            return {"success": False, "error": f"Invalid response from SysBot (HTTP {code}).", "villagers": []}
+        return data
+
+    async def inject_villagers(
+        self,
+        villagers: Union[str, Dict[str, Any], List[Union[str, Dict[str, Any]]]],
+        plot: Optional[int] = None,
+    ) -> dict:
+        """
+        Inject one or more villagers into island house plots via SysBot POST /api/villagers.
+
+        Accepts:
+          - Single name: inject_villagers("Raymond", plot=1) -> {"villager": "Raymond", "plot": 1}
+          - List of names: inject_villagers(["Raymond", "Marshal"]) -> ["Raymond", "Marshal"]
+          - List of dicts: inject_villagers([{"villager": "Raymond", "plot": 1}, {"name": "Judy", "plot": 2}])
+          - Dict payload: {"villagers": [...]} or {"villager": "Raymond", "plot": 1}
+          - Command string: inject_villagers("!inject Raymond 1")
+        """
+        if not villagers:
+            return {"success": False, "error": "No villager specified for injection."}
+
+        payload: Any
+        if isinstance(villagers, str):
+            v_str = villagers.strip()
+            if v_str.startswith("!inject "):
+                payload = {"command": v_str}
+            elif plot is not None:
+                payload = {"villager": v_str, "plot": int(plot)}
+            else:
+                payload = {"villager": v_str}
+        elif isinstance(villagers, (dict, list)):
+            payload = villagers
+        else:
+            payload = str(villagers)
+
+        data, code = await asyncio.to_thread(self._post, "/api/villagers", payload)
+        if not isinstance(data, dict):
+            return {"success": False, "error": f"Invalid response from SysBot (HTTP {code})."}
+        return data
+
+    async def submit_drop(
+        self,
+        items: Union[str, List[str]],
+        drop_type: str = "items",
+        username: str = "WebUser",
+        count: Optional[int] = None,
+    ) -> dict:
+        """
+        Request items or DIY recipes to be dropped on the ground via SysBot POST /api/drop.
+        """
+        payload: Dict[str, Any] = {"type": drop_type, "username": username}
+        if isinstance(items, list):
+            payload["items"] = items
+        else:
+            payload["items"] = str(items)
+
+        if count is not None:
+            payload["count"] = int(count)
+
+        data, code = await asyncio.to_thread(self._post, "/api/drop", payload)
+        if not isinstance(data, dict):
+            return {"success": False, "error": f"Invalid response from SysBot (HTTP {code})."}
+        return data
+
+    async def submit_clean(self) -> dict:
+        """
+        Order the bot to pick up (clean) all dropped items on the ground via SysBot POST /api/clean.
+        """
+        data, code = await asyncio.to_thread(self._post, "/api/clean", {})
+        if not isinstance(data, dict):
+            return {"success": False, "error": f"Invalid response from SysBot (HTTP {code})."}
+        return data
+
+    async def set_turnips(self, price: int = 999999999) -> dict:
+        """
+        Set island turnip stalk market price via SysBot POST /api/turnips.
+        """
+        data, code = await asyncio.to_thread(self._post, "/api/turnips", {"value": int(price)})
+        if not isinstance(data, dict):
+            return {"success": False, "error": f"Invalid response from SysBot (HTTP {code})."}
+        return data
+
+    async def speak(self, message: str) -> dict:
+        """
+        Send a chat message to the in-game chat on the Switch via SysBot POST /api/speak.
+        """
+        data, code = await asyncio.to_thread(self._post, "/api/speak", {"message": str(message)})
+        if not isinstance(data, dict):
+            return {"success": False, "error": f"Invalid response from SysBot (HTTP {code})."}
+        return data
+

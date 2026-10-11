@@ -2945,7 +2945,7 @@ def _sysbot_get(path: str, **params) -> tuple:
         return {"success": False, "error": str(exc)}, 500
 
 
-def _sysbot_post(path: str, body: dict | None = None) -> tuple:
+def _sysbot_post(path: str, body: dict | list | None = None) -> tuple:
     """Forward a POST to the SysBot API.  Returns (dict, http_status)."""
     global _sysbot_offline_until
     base = getattr(Config, "SYSBOT_API_URL", "") or ""
@@ -2962,7 +2962,7 @@ def _sysbot_post(path: str, body: dict | None = None) -> tuple:
         resp = _get_sysbot_session().post(
             url,
             headers=_sysbot_headers(),
-            json=body or {},
+            json=body if body is not None else {},
             timeout=(3.0, 15.0),
         )
         elapsed = round((time.monotonic() - t0) * 1000)
@@ -3589,15 +3589,28 @@ def order_clean():
 
 # ── Villagers ────────────────────────────────────────────────────────────────
 
-@app.route("/api/order/villagers", methods=["GET"])
+@app.route("/api/order/villagers", methods=["GET", "POST"])
+@app.route("/api/order/villagers/inject", methods=["POST"])
+@app.route("/api/order/villager/inject", methods=["POST"])
 def order_villagers():
     """
-    Proxy GET /api/villagers from SysBot.
-    Returns the list of villagers currently on the island.
+    GET  -> List villagers currently on the island from SysBot.
+    POST -> Inject villager(s) into island plots via SysBot POST /api/villagers.
     """
     auth_user = _current_auth_user()
     if not auth_user:
         return jsonify({"success": False, "error": "Authentication required. Please log in with Discord."}), 401
+
+    if request.method == "POST":
+        body = request.get_json(silent=True)
+        if body is None:
+            raw_text = request.get_data(as_text=True).strip()
+            if not raw_text:
+                return jsonify({"success": False, "error": "Request body is empty."}), 400
+            body = {"command": raw_text}
+
+        result, code = _sysbot_post("/api/villagers", body)
+        return jsonify(result), code
 
     data, code = _sysbot_get("/api/villagers")
     return jsonify(data), code
